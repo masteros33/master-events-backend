@@ -5,7 +5,7 @@ from rest_framework.response import Response
 from django.conf import settings
 from .models import Wallet, Transaction
 from .serializers import WalletSerializer, TransactionSerializer
-import requests
+from utils.emails import notify_withdrawal
 import uuid
 
 @api_view(['GET'])
@@ -47,6 +47,9 @@ def withdraw(request):
         reference=reference,
         status='completed',
     )
+
+    # Send notification + email
+    notify_withdrawal(wallet, amount, method, reference)
 
     return Response({
         'message': 'Withdrawal initiated successfully',

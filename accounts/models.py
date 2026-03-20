@@ -28,6 +28,7 @@ class User(AbstractUser):
     email = models.EmailField(unique=True)
     phone = models.CharField(max_length=20, blank=True)
     role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='attendee')
+    wallet_address = models.CharField(max_length=100, blank=True, null=True)
     is_verified = models.BooleanField(default=False)
 
     USERNAME_FIELD = 'email'
@@ -44,3 +45,31 @@ class User(AbstractUser):
     @property
     def full_name(self):
         return f"{self.first_name} {self.last_name}"
+
+
+
+class Notification(models.Model):
+    TYPE_CHOICES = [
+        ('purchase', 'Ticket Purchase'),
+        ('transfer_sent', 'Transfer Sent'),
+        ('transfer_received', 'Transfer Received'),
+        ('resale_listed', 'Resale Listed'),
+        ('resale_sold', 'Resale Sold'),
+        ('withdrawal', 'Withdrawal'),
+        ('sale', 'New Sale'),
+        ('event', 'Event Update'),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='notifications')
+    type = models.CharField(max_length=30, choices=TYPE_CHOICES)
+    title = models.CharField(max_length=200)
+    body = models.TextField()
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'notifications'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.user.email} - {self.title}"

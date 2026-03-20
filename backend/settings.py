@@ -113,3 +113,23 @@ CORS_ALLOW_CREDENTIALS = True
 
 PAYSTACK_SECRET_KEY = os.getenv('PAYSTACK_SECRET_KEY', '')
 PAYSTACK_PUBLIC_KEY = os.getenv('PAYSTACK_PUBLIC_KEY', '')
+
+
+
+
+# Email Settings
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = 'smtp.gmail.com'
+EMAIL_PORT = 587
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', 'Master Events <mastereventgh@gmail.com>')
+
+
+
+
+# Blockchain Settings
+NFT_CONTRACT_ADDRESS = os.getenv('NFT_CONTRACT_ADDRESS', '')
+BLOCKCHAIN_PRIVATE_KEY = os.getenv('BLOCKCHAIN_PRIVATE_KEY', '')
+THIRDWEB_SECRET_KEY = os.getenv('THIRDWEB_SECRET_KEY', '')

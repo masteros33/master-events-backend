@@ -3,18 +3,18 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from django.utils import timezone
-from django.conf import settings
 from django.core.files.base import ContentFile
 from .models import Ticket, DoorStaffCode, TicketTransfer
 from .serializers import TicketSerializer, PurchaseSerializer, TransferSerializer, VerifyTicketSerializer, DoorStaffCodeSerializer
 from events.models import Event
 from accounts.models import User
 from payments.models import Wallet, Transaction
+from utils.emails import notify_ticket_purchase, notify_ticket_transfer
+from utils.blockchain import mint_ticket_nft, get_polygon_explorer_url
+from decimal import Decimal
 import random
 import string
-import uuid
 import qrcode
-import qrcode.image.svg
 from io import BytesIO
 import base64
 
@@ -41,9 +41,8 @@ def purchase_ticket(request):
     if event.tickets_remaining < data['quantity']:
         return Response({'error': 'Not enough tickets available'}, status=status.HTTP_400_BAD_REQUEST)
 
-    total = float(event.price) * data['quantity']
+    total = Decimal(str(float(event.price) * data['quantity']))
 
-    # Create ticket first to get UUID
     ticket = Ticket(
         event=event,
         owner=request.user,
@@ -54,7 +53,6 @@ def purchase_ticket(request):
     )
     ticket.save()
 
-    # Generate QR code as base64
     qr_content = f"MASTER-EVENTS:{ticket.id}:{event.id}:{request.user.id}"
     ticket.qr_data = qr_content
 
@@ -66,19 +64,14 @@ def purchase_ticket(request):
     img.save(buffer, format='PNG')
     qr_base64 = base64.b64encode(buffer.getvalue()).decode()
 
-    # Save QR image to ticket
-    ticket.qr_image = ContentFile(
-        buffer.getvalue(),
-        name=f"qr_{ticket.ticket_id}.png"
-    )
+    ticket.qr_image = ContentFile(buffer.getvalue(), name=f"qr_{ticket.ticket_id}.png")
     ticket.save()
 
     event.tickets_sold += data['quantity']
     event.save()
 
-    # Split payment — 95% organizer, 5% platform
     organizer_wallet, _ = Wallet.objects.get_or_create(user=event.organizer)
-    organizer_amount = total * 0.95
+    organizer_amount = total * Decimal('0.95')
 
     organizer_wallet.balance += organizer_amount
     organizer_wallet.total_earned += organizer_amount
@@ -93,8 +86,27 @@ def purchase_ticket(request):
         status='completed',
     )
 
+    # Send notification + email
+    notify_ticket_purchase(ticket)
+
+    # Prepare response
     ticket_data = TicketSerializer(ticket).data
     ticket_data['qr_base64'] = qr_base64
+
+    # Mint NFT on blockchain (non-blocking)
+    try:
+        owner_wallet = getattr(request.user, 'wallet_address', None)
+        nft_result = mint_ticket_nft(ticket, owner_wallet)
+        if nft_result:
+            ticket.nft_token_id = nft_result['token_id']
+            ticket.nft_tx_hash = nft_result['tx_hash']
+            ticket.nft_token_uri = nft_result['token_uri']
+            ticket.save()
+            ticket_data['nft_token_id'] = nft_result['token_id']
+            ticket_data['nft_tx_hash'] = nft_result['tx_hash']
+            ticket_data['blockchain_url'] = get_polygon_explorer_url(nft_result['tx_hash'])
+    except Exception as e:
+        print(f"NFT mint failed (non-critical): {e}")
 
     return Response(ticket_data, status=status.HTTP_201_CREATED)
 
@@ -134,6 +146,21 @@ def transfer_ticket(request):
         is_resale=True,
     )
 
+    # Send notification + email
+    notify_ticket_transfer(ticket, request.user, to_user)
+
+    # Transfer NFT on blockchain
+    try:
+        if ticket.nft_token_id and to_user.wallet_address:
+            from utils.blockchain import transfer_ticket_nft
+            transfer_ticket_nft(
+                ticket.nft_token_id,
+                request.user.wallet_address,
+                to_user.wallet_address
+            )
+    except Exception as e:
+        print(f"NFT transfer failed (non-critical): {e}")
+
     return Response({'message': 'Ticket transferred successfully', 'new_ticket': TicketSerializer(new_ticket).data})
 
 @api_view(['POST'])
@@ -144,10 +171,16 @@ def verify_ticket(request):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     data = serializer.validated_data
+    qr_data = data['qr_data'].strip()
+
+    ticket = None
     try:
-        ticket = Ticket.objects.get(qr_data=data['qr_data'])
+        ticket = Ticket.objects.get(qr_data=qr_data)
     except Ticket.DoesNotExist:
-        return Response({'valid': False, 'reason': 'Ticket not found'}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            ticket = Ticket.objects.get(ticket_id=qr_data.upper())
+        except Ticket.DoesNotExist:
+            return Response({'valid': False, 'reason': 'Ticket not found'}, status=status.HTTP_404_NOT_FOUND)
 
     if ticket.event.id != data['event_id']:
         return Response({'valid': False, 'reason': 'Wrong event', 'holder': ticket.owner.full_name})
@@ -169,15 +202,20 @@ def verify_ticket(request):
         'event': ticket.event.name,
         'quantity': ticket.quantity,
         'is_transfer': ticket.is_resale,
+        'nft_token_id': ticket.nft_token_id,
+        'blockchain_url': get_polygon_explorer_url(ticket.nft_tx_hash) if ticket.nft_tx_hash else None,
     })
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def generate_door_code(request, event_id):
     try:
-        event = Event.objects.get(pk=event_id, organizer=request.user)
+        event = Event.objects.get(pk=event_id)
     except Event.DoesNotExist:
-        return Response({'error': 'Event not found'}, status=status.HTTP_404_NOT_FOUND)
+        return Response({'error': f'Event {event_id} not found'}, status=status.HTTP_404_NOT_FOUND)
+
+    if event.organizer != request.user:
+        return Response({'error': 'You are not the organizer.'}, status=status.HTTP_403_FORBIDDEN)
 
     code = 'DOOR-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
     door_code = DoorStaffCode.objects.create(event=event, code=code, created_by=request.user)
