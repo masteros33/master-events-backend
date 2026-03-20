@@ -6,4 +6,6 @@ urlpatterns = [
     path('login/', views.login, name='login'),
     path('me/', views.me, name='me'),
     path('logout/', views.logout, name='logout'),
+    path('notifications/', views.notifications, name='notifications'),
+    path('notifications/read/', views.mark_all_read, name='mark-all-read'),
 ]

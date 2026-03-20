@@ -4,6 +4,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 from .serializers import RegisterSerializer, LoginSerializer, UserSerializer
+from .models import Notification
 
 def get_tokens(user):
     refresh = RefreshToken.for_user(user)
@@ -53,3 +54,27 @@ def logout(request):
     except Exception:
         pass
     return Response({'message': 'Logged out successfully'})
+
+
+
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def notifications(request):
+    notifs = Notification.objects.filter(user=request.user)[:20]
+    data = [{
+        'id': n.id,
+        'type': n.type,
+        'title': n.title,
+        'body': n.body,
+        'is_read': n.is_read,
+        'created_at': n.created_at.isoformat(),
+    } for n in notifs]
+    return Response(data)
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def mark_all_read(request):
+    Notification.objects.filter(user=request.user, is_read=False).update(is_read=True)
+    return Response({'message': 'All marked as read'})
