@@ -12,6 +12,7 @@ SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-master-events-dev-key-chan
 DEBUG = True
 
 ALLOWED_HOSTS = ['*']
+CORS_ALLOW_ALL_ORIGINS = True
 
 INSTALLED_APPS = [
     'django.contrib.admin',
