@@ -3,8 +3,14 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
+from django.contrib.auth.tokens import default_token_generator
+from django.utils.encoding import force_bytes, force_str
+from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
+from django.core.mail import send_mail
+from django.conf import settings
 from .serializers import RegisterSerializer, LoginSerializer, UserSerializer
-from .models import Notification
+from .models import Notification, User
+
 
 def get_tokens(user):
     refresh = RefreshToken.for_user(user)
@@ -12,6 +18,7 @@ def get_tokens(user):
         'refresh': str(refresh),
         'access': str(refresh.access_token),
     }
+
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -26,6 +33,7 @@ def register(request):
         }, status=status.HTTP_201_CREATED)
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def login(request):
@@ -39,10 +47,12 @@ def login(request):
         })
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def me(request):
     return Response(UserSerializer(request.user).data)
+
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -56,7 +66,76 @@ def logout(request):
     return Response({'message': 'Logged out successfully'})
 
 
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def forgot_password(request):
+    email = request.data.get('email', '').strip().lower()
+    if not email:
+        return Response({'error': 'Email is required'}, status=status.HTTP_400_BAD_REQUEST)
 
+    try:
+        user = User.objects.get(email=email)
+    except User.DoesNotExist:
+        # Return success even if user not found (security)
+        return Response({'message': 'If an account exists, a reset link has been sent.'})
+
+    token = default_token_generator.make_token(user)
+    uid = urlsafe_base64_encode(force_bytes(user.pk))
+
+    reset_url = f"https://master-events-bi7m.vercel.app/reset-password?uid={uid}&token={token}"
+
+    try:
+        send_mail(
+            subject='Reset Your Master Events Password',
+            message=f'''Hi {user.first_name},
+
+You requested a password reset for your Master Events account.
+
+Click the link below to reset your password:
+{reset_url}
+
+This link expires in 24 hours.
+
+If you did not request this, ignore this email.
+
+— Master Events Team''',
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[user.email],
+            fail_silently=False,
+        )
+    except Exception as e:
+        print(f"Email error: {e}")
+        return Response({'error': 'Failed to send email. Try again.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    return Response({'message': 'Password reset link sent to your email.'})
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def reset_password(request):
+    uid = request.data.get('uid', '')
+    token = request.data.get('token', '')
+    new_password = request.data.get('new_password', '')
+
+    if not uid or not token or not new_password:
+        return Response({'error': 'Missing required fields'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if len(new_password) < 8:
+        return Response({'error': 'Password must be at least 8 characters'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        user_id = force_str(urlsafe_base64_decode(uid))
+        user = User.objects.get(pk=user_id)
+    except (TypeError, ValueError, User.DoesNotExist):
+        return Response({'error': 'Invalid reset link'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not default_token_generator.check_token(user, token):
+        return Response({'error': 'Reset link expired or invalid'}, status=status.HTTP_400_BAD_REQUEST)
+
+    user.set_password(new_password)
+    user.save()
+
+    return Response({'message': 'Password reset successfully. You can now log in.'})
 
 
 @api_view(['GET'])
@@ -72,6 +151,7 @@ def notifications(request):
         'created_at': n.created_at.isoformat(),
     } for n in notifs]
     return Response(data)
+
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
