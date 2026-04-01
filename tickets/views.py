@@ -93,18 +93,26 @@ def purchase_ticket(request):
     ticket_data = TicketSerializer(ticket).data
     ticket_data['qr_base64'] = qr_base64
 
-    # Mint NFT on blockchain (non-blocking)
+# Mint NFT async — doesn't block API response
     try:
+        from utils.blockchain import mint_ticket_nft_async
         owner_wallet = getattr(request.user, 'wallet_address', None)
-        nft_result = mint_ticket_nft(ticket, owner_wallet)
-        if nft_result:
-            ticket.nft_token_id = nft_result['token_id']
-            ticket.nft_tx_hash = nft_result['tx_hash']
-            ticket.nft_token_uri = nft_result['token_uri']
-            ticket.save()
-            ticket_data['nft_token_id'] = nft_result['token_id']
-            ticket_data['nft_tx_hash'] = nft_result['tx_hash']
-            ticket_data['blockchain_url'] = get_polygon_explorer_url(nft_result['tx_hash'])
+
+        def on_mint_success(nft_result):
+            try:
+                from tickets.models import Ticket as TicketModel
+                t = TicketModel.objects.get(pk=ticket.pk)
+                t.nft_token_id = nft_result['token_id']
+                t.nft_tx_hash = nft_result['tx_hash']
+                t.nft_token_uri = nft_result['token_uri']
+                t.save()
+                print(f"✅ Ticket {t.ticket_id} NFT saved: token_id={nft_result['token_id']}")
+            except Exception as e:
+                print(f"Error saving NFT result: {e}")
+
+        mint_ticket_nft_async(ticket, owner_wallet, callback=on_mint_success)
+        ticket_data['nft_minting'] = True
+        ticket_data['message'] = 'Ticket purchased! NFT minting on Polygon...'
     except Exception as e:
         print(f"NFT mint failed (non-critical): {e}")
 
