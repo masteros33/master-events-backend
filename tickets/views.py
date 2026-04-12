@@ -236,14 +236,12 @@ def transfer_ticket(request):
         'message': 'Ticket transferred successfully',
         'new_ticket': TicketSerializer(new_ticket, context={'request': request}).data
     })
-
-
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def verify_ticket(request):
     serializer = VerifyTicketSerializer(data=request.data)
     if not serializer.is_valid():
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        return Response(serializer.errors, status=400)
 
     data     = serializer.validated_data
     qr_data  = data['qr_data'].strip()
@@ -251,71 +249,81 @@ def verify_ticket(request):
 
     ticket = None
 
-    # ✅ Try all matching strategies
-    # 1. Exact qr_data match
-    try:
-        ticket = Ticket.objects.get(qr_data=qr_data)
-    except Ticket.DoesNotExist:
-        pass
+    # ── Strategy 1: Dynamic HMAC QR (primary — most secure) ──
+    from .serializers import verify_dynamic_qr_token
+    ticket_id_from_qr, event_id_from_qr = verify_dynamic_qr_token(qr_data)
 
-    # 2. ticket_id match (manual entry)
+    if ticket_id_from_qr:
+        try:
+            ticket = Ticket.objects.get(ticket_id=ticket_id_from_qr)
+        except Ticket.DoesNotExist:
+            pass
+
+    # ── Strategy 2: Static qr_data fallback (old tickets) ────
+    if not ticket:
+        try:
+            ticket = Ticket.objects.get(qr_data=qr_data)
+        except Ticket.DoesNotExist:
+            pass
+
+    # ── Strategy 3: Manual ticket_id entry ───────────────────
     if not ticket:
         try:
             ticket = Ticket.objects.get(ticket_id=qr_data.upper())
         except Ticket.DoesNotExist:
             pass
 
-    # 3. Parse MASTER-EVENTS format and extract UUID
+    # ── Strategy 4: Parse old MASTER-EVENTS UUID format ──────
     if not ticket and qr_data.startswith('MASTER-EVENTS:'):
         try:
             parts = qr_data.split(':')
             if len(parts) >= 2:
-                ticket_uuid = parts[1]
-                ticket = Ticket.objects.get(id=ticket_uuid)
-        except (Ticket.DoesNotExist, Exception):
+                ticket = Ticket.objects.get(id=parts[1])
+        except Exception:
             pass
 
     if not ticket:
         return Response(
-            {'valid': False, 'reason': 'Ticket not found'},
-            status=status.HTTP_404_NOT_FOUND
+            {'valid': False, 'reason': 'Ticket not found or QR expired'},
+            status=404
         )
 
-    # ✅ Check event — allow if event_id matches or is 0 (organizer scan any event)
+    # ── Event check ───────────────────────────────────────────
     if event_id and event_id != 0 and ticket.event.id != event_id:
         return Response({
-            'valid': False,
+            'valid':  False,
             'reason': f'Wrong event — ticket is for {ticket.event.name}',
             'holder': ticket.owner.get_full_name() or ticket.owner.email,
         })
 
+    # ── Status check ──────────────────────────────────────────
     if ticket.status == 'redeemed':
         return Response({
-            'valid': False,
+            'valid':  False,
             'reason': 'Already redeemed',
             'holder': ticket.owner.get_full_name() or ticket.owner.email,
         })
 
     if ticket.status not in ['active', 'resale']:
         return Response({
-            'valid': False,
+            'valid':  False,
             'reason': f'Ticket is {ticket.status}',
             'holder': ticket.owner.get_full_name() or ticket.owner.email,
         })
 
-    # ✅ Admit — mark as redeemed
+    # ── Admit ─────────────────────────────────────────────────
     ticket.status      = 'redeemed'
     ticket.redeemed_at = timezone.now()
     ticket.save()
 
     return Response({
-        'valid':        True,
-        'holder':       ticket.owner.get_full_name() or ticket.owner.email,
-        'ticket_id':    ticket.ticket_id,
-        'event':        ticket.event.name,
-        'quantity':     ticket.quantity,
-        'is_transfer':  ticket.is_resale,
-        'nft_token_id': ticket.nft_token_id,
+        'valid':          True,
+        'holder':         ticket.owner.get_full_name() or ticket.owner.email,
+        'ticket_id':      ticket.ticket_id,
+        'event':          ticket.event.name,
+        'quantity':       ticket.quantity,
+        'is_transfer':    ticket.is_resale,
+        'nft_token_id':   ticket.nft_token_id,
         'blockchain_url': get_polygon_explorer_url(ticket.nft_tx_hash) if ticket.nft_tx_hash else None,
     })
 

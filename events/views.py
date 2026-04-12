@@ -5,23 +5,38 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
 from .models import Event
 from .serializers import EventSerializer, EventCreateSerializer
-import cloudinary.uploader
+
+def upload_image_to_cloudinary(image_source):
+    """Upload file or base64 to Cloudinary, return secure URL or None"""
+    try:
+        import cloudinary.uploader
+        result = cloudinary.uploader.upload(
+            image_source,
+            folder="master_events/events",
+            resource_type="image",
+            transformation=[{
+                'width': 1200, 'height': 600,
+                'crop': 'fill', 'quality': 'auto', 'fetch_format': 'auto'
+            }]
+        )
+        print(f"✅ Cloudinary upload: {result['secure_url']}")
+        return result['secure_url']
+    except Exception as e:
+        print(f"⚠️ Cloudinary upload failed: {e}")
+        return None
+
 
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def event_list(request):
-    city     = request.query_params.get('city', None)
-    category = request.query_params.get('category', None)
-    search   = request.query_params.get('search', None)
-
-    events = Event.objects.filter(is_active=True, sales_open=True)
-
+    city     = request.query_params.get('city')
+    category = request.query_params.get('category')
+    search   = request.query_params.get('search')
+    events   = Event.objects.filter(is_active=True, sales_open=True)
     if city:     events = events.filter(city__icontains=city)
     if category: events = events.filter(category=category)
     if search:   events = events.filter(name__icontains=search)
-
-    serializer = EventSerializer(events, many=True)
-    return Response(serializer.data)
+    return Response(EventSerializer(events, many=True).data)
 
 
 @api_view(['GET'])
@@ -30,9 +45,8 @@ def event_detail(request, pk):
     try:
         event = Event.objects.get(pk=pk, is_active=True)
     except Event.DoesNotExist:
-        return Response({'error': 'Event not found'}, status=status.HTTP_404_NOT_FOUND)
-    serializer = EventSerializer(event)
-    return Response(serializer.data)
+        return Response({'error': 'Event not found'}, status=404)
+    return Response(EventSerializer(event).data)
 
 
 @api_view(['POST'])
@@ -40,60 +54,48 @@ def event_detail(request, pk):
 @parser_classes([MultiPartParser, FormParser, JSONParser])
 def event_create(request):
     if request.user.role != 'organizer':
-        return Response({'error': 'Only organizers can create events'}, status=status.HTTP_403_FORBIDDEN)
+        return Response({'error': 'Only organizers can create events'}, status=403)
 
-    # ── Mutable copy so we can swap image field ───────────────
-    data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
+    # Build mutable data dict
+    data = {}
+    for key in request.data:
+        data[key] = request.data[key]
 
-    # ── Cloudinary image upload ───────────────────────────────
+    # ── Handle image ──────────────────────────────────────────
     image_file = request.FILES.get('image')
-    image_data = data.get('image', '')
+    image_str  = data.get('image', '')
 
     if image_file:
-        # Actual file upload from <input type="file">
-        try:
-            result = cloudinary.uploader.upload(
-                image_file,
-                folder="master_events/events",
-                resource_type="image",
-                transformation=[{
-                    'width': 1200, 'height': 600,
-                    'crop': 'fill', 'quality': 'auto', 'fetch_format': 'auto'
-                }]
-            )
-            data['image'] = result['secure_url']
-            print(f"✅ Cloudinary upload success: {result['secure_url']}")
-        except Exception as e:
-            print(f"⚠️ Cloudinary file upload error: {e}")
-            # Don't block event creation — just skip image
+        # Real file upload
+        url = upload_image_to_cloudinary(image_file)
+        if url:
+            data['image'] = url
+        else:
+            data.pop('image', None)
 
-    elif isinstance(image_data, str) and image_data.startswith('data:'):
-        # Base64 image from frontend (drag & drop or canvas)
-        try:
-            result = cloudinary.uploader.upload(
-                image_data,
-                folder="master_events/events",
-                resource_type="image",
-                transformation=[{
-                    'width': 1200, 'height': 600,
-                    'crop': 'fill', 'quality': 'auto', 'fetch_format': 'auto'
-                }]
-            )
-            data['image'] = result['secure_url']
-            print(f"✅ Cloudinary base64 upload success: {result['secure_url']}")
-        except Exception as e:
-            print(f"⚠️ Cloudinary base64 upload error: {e}")
-            # Don't block event creation — just skip image
+    elif isinstance(image_str, str) and image_str.startswith('data:'):
+        # Base64 from frontend
+        url = upload_image_to_cloudinary(image_str)
+        if url:
+            data['image'] = url
+        else:
+            data.pop('image', None)
 
-    elif isinstance(image_data, str) and image_data.startswith('http'):
+    elif isinstance(image_str, str) and image_str.startswith('http'):
         # Already a URL — keep as is
         pass
+
+    else:
+        # No image — remove so serializer doesn't complain
+        data.pop('image', None)
 
     serializer = EventCreateSerializer(data=data, context={'request': request})
     if serializer.is_valid():
         event = serializer.save()
-        return Response(EventSerializer(event).data, status=status.HTTP_201_CREATED)
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        return Response(EventSerializer(event).data, status=201)
+
+    print(f"Event create errors: {serializer.errors}")
+    return Response(serializer.errors, status=400)
 
 
 @api_view(['PUT', 'PATCH'])
@@ -103,49 +105,27 @@ def event_update(request, pk):
     try:
         event = Event.objects.get(pk=pk, organizer=request.user)
     except Event.DoesNotExist:
-        return Response({'error': 'Event not found'}, status=status.HTTP_404_NOT_FOUND)
+        return Response({'error': 'Event not found'}, status=404)
 
-    data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
+    data = {}
+    for key in request.data:
+        data[key] = request.data[key]
 
-    # ── Cloudinary image upload on edit too ───────────────────
     image_file = request.FILES.get('image')
-    image_data = data.get('image', '')
+    image_str  = data.get('image', '')
 
     if image_file:
-        try:
-            result = cloudinary.uploader.upload(
-                image_file,
-                folder="master_events/events",
-                resource_type="image",
-                transformation=[{
-                    'width': 1200, 'height': 600,
-                    'crop': 'fill', 'quality': 'auto', 'fetch_format': 'auto'
-                }]
-            )
-            data['image'] = result['secure_url']
-        except Exception as e:
-            print(f"⚠️ Cloudinary update upload error: {e}")
-
-    elif isinstance(image_data, str) and image_data.startswith('data:'):
-        try:
-            result = cloudinary.uploader.upload(
-                image_data,
-                folder="master_events/events",
-                resource_type="image",
-                transformation=[{
-                    'width': 1200, 'height': 600,
-                    'crop': 'fill', 'quality': 'auto', 'fetch_format': 'auto'
-                }]
-            )
-            data['image'] = result['secure_url']
-        except Exception as e:
-            print(f"⚠️ Cloudinary base64 update error: {e}")
+        url = upload_image_to_cloudinary(image_file)
+        if url: data['image'] = url
+    elif isinstance(image_str, str) and image_str.startswith('data:'):
+        url = upload_image_to_cloudinary(image_str)
+        if url: data['image'] = url
 
     serializer = EventCreateSerializer(event, data=data, partial=True, context={'request': request})
     if serializer.is_valid():
         serializer.save()
         return Response(EventSerializer(event).data)
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    return Response(serializer.errors, status=400)
 
 
 @api_view(['DELETE'])
@@ -154,7 +134,7 @@ def event_delete(request, pk):
     try:
         event = Event.objects.get(pk=pk, organizer=request.user)
     except Event.DoesNotExist:
-        return Response({'error': 'Event not found'}, status=status.HTTP_404_NOT_FOUND)
+        return Response({'error': 'Event not found'}, status=404)
     event.is_active = False
     event.save()
     return Response({'message': 'Event deleted'})
@@ -164,10 +144,9 @@ def event_delete(request, pk):
 @permission_classes([IsAuthenticated])
 def my_events(request):
     if request.user.role != 'organizer':
-        return Response({'error': 'Only organizers can view this'}, status=status.HTTP_403_FORBIDDEN)
+        return Response({'error': 'Only organizers can view this'}, status=403)
     events = Event.objects.filter(organizer=request.user, is_active=True)
-    serializer = EventSerializer(events, many=True)
-    return Response(serializer.data)
+    return Response(EventSerializer(events, many=True).data)
 
 
 @api_view(['POST'])
@@ -176,7 +155,7 @@ def toggle_sales(request, pk):
     try:
         event = Event.objects.get(pk=pk, organizer=request.user)
     except Event.DoesNotExist:
-        return Response({'error': 'Event not found'}, status=status.HTTP_404_NOT_FOUND)
+        return Response({'error': 'Event not found'}, status=404)
     event.sales_open = not event.sales_open
     event.save()
     return Response({'sales_open': event.sales_open})
