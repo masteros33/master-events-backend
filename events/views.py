@@ -6,12 +6,13 @@ from rest_framework.response import Response
 from .models import Event
 from .serializers import EventSerializer, EventCreateSerializer
 
-def upload_image_to_cloudinary(image_source):
-    """Upload file or base64 to Cloudinary, return secure URL or None"""
+
+def upload_to_cloudinary(source):
+    """Upload file or base64 or URL to Cloudinary. Returns URL string or None."""
     try:
         import cloudinary.uploader
         result = cloudinary.uploader.upload(
-            image_source,
+            source,
             folder="master_events/events",
             resource_type="image",
             transformation=[{
@@ -19,7 +20,7 @@ def upload_image_to_cloudinary(image_source):
                 'crop': 'fill', 'quality': 'auto', 'fetch_format': 'auto'
             }]
         )
-        print(f"✅ Cloudinary upload: {result['secure_url']}")
+        print(f"✅ Cloudinary upload OK: {result['secure_url']}")
         return result['secure_url']
     except Exception as e:
         print(f"⚠️ Cloudinary upload failed: {e}")
@@ -54,47 +55,51 @@ def event_detail(request, pk):
 @parser_classes([MultiPartParser, FormParser, JSONParser])
 def event_create(request):
     if request.user.role != 'organizer':
-        return Response({'error': 'Only organizers can create events'}, status=403)
+        return Response(
+            {'error': 'Only organizers can create events'},
+            status=status.HTTP_403_FORBIDDEN
+        )
 
-    # Build mutable data dict
+    # ── Build plain dict from request (works for JSON + multipart) ──
     data = {}
     for key in request.data:
-        data[key] = request.data[key]
+        val = request.data[key]
+        # QueryDict returns lists for multipart — take first value
+        data[key] = val[0] if isinstance(val, list) else val
 
-    # ── Handle image ──────────────────────────────────────────
+    # ── Image handling ────────────────────────────────────────
     image_file = request.FILES.get('image')
-    image_str  = data.get('image', '')
+    image_val  = data.get('image', '')
 
     if image_file:
-        # Real file upload
-        url = upload_image_to_cloudinary(image_file)
-        if url:
-            data['image'] = url
-        else:
-            data.pop('image', None)
+        # Real file upload — send to Cloudinary
+        url = upload_to_cloudinary(image_file)
+        data['image'] = url or ''
 
-    elif isinstance(image_str, str) and image_str.startswith('data:'):
+    elif isinstance(image_val, str) and image_val.startswith('data:image'):
         # Base64 from frontend
-        url = upload_image_to_cloudinary(image_str)
-        if url:
-            data['image'] = url
-        else:
-            data.pop('image', None)
+        url = upload_to_cloudinary(image_val)
+        data['image'] = url or ''
 
-    elif isinstance(image_str, str) and image_str.startswith('http'):
-        # Already a URL — keep as is
-        pass
+    elif isinstance(image_val, str) and image_val.startswith('http'):
+        # Already a valid URL — keep as is
+        data['image'] = image_val
 
     else:
-        # No image — remove so serializer doesn't complain
-        data.pop('image', None)
+        # No image or empty string — set to empty
+        data['image'] = ''
 
-    serializer = EventCreateSerializer(data=data, context={'request': request})
+    # ── Validate and save ────────────────────────────────────
+    serializer = EventCreateSerializer(
+        data=data,
+        context={'request': request}
+    )
     if serializer.is_valid():
         event = serializer.save()
+        print(f"✅ Event created: {event.name} (id={event.id})")
         return Response(EventSerializer(event).data, status=201)
 
-    print(f"Event create errors: {serializer.errors}")
+    print(f"❌ Event create validation errors: {serializer.errors}")
     return Response(serializer.errors, status=400)
 
 
@@ -109,22 +114,32 @@ def event_update(request, pk):
 
     data = {}
     for key in request.data:
-        data[key] = request.data[key]
+        val = request.data[key]
+        data[key] = val[0] if isinstance(val, list) else val
 
     image_file = request.FILES.get('image')
-    image_str  = data.get('image', '')
+    image_val  = data.get('image', '')
 
     if image_file:
-        url = upload_image_to_cloudinary(image_file)
-        if url: data['image'] = url
-    elif isinstance(image_str, str) and image_str.startswith('data:'):
-        url = upload_image_to_cloudinary(image_str)
+        url = upload_to_cloudinary(image_file)
         if url: data['image'] = url
 
-    serializer = EventCreateSerializer(event, data=data, partial=True, context={'request': request})
+    elif isinstance(image_val, str) and image_val.startswith('data:image'):
+        url = upload_to_cloudinary(image_val)
+        if url: data['image'] = url
+
+    elif isinstance(image_val, str) and image_val.startswith('http'):
+        data['image'] = image_val
+
+    serializer = EventCreateSerializer(
+        event, data=data, partial=True,
+        context={'request': request}
+    )
     if serializer.is_valid():
         serializer.save()
         return Response(EventSerializer(event).data)
+
+    print(f"❌ Event update errors: {serializer.errors}")
     return Response(serializer.errors, status=400)
 
 
