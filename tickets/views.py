@@ -4,7 +4,7 @@ from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from django.utils import timezone
 from .models import Ticket, DoorStaffCode, TicketTransfer
-from .serializers import TicketSerializer, PurchaseSerializer, TransferSerializer, VerifyTicketSerializer, DoorStaffCodeSerializer
+from .serializers import TicketSerializer, PurchaseSerializer, TransferSerializer, VerifyTicketSerializer, DoorStaffCodeSerializer, verify_dynamic_qr_token
 from events.models import Event
 from accounts.models import User
 from payments.models import Wallet, Transaction
@@ -47,7 +47,6 @@ def purchase_ticket(request):
 
     total = Decimal(str(float(event.price) * data['quantity']))
 
-    # ✅ Create ticket first so we have the ID
     ticket = Ticket(
         event=event,
         owner=request.user,
@@ -56,26 +55,18 @@ def purchase_ticket(request):
         price_paid=total,
         status='active',
     )
-    ticket.save()  # ticket_id and qr_data set in model.save()
+    ticket.save()
 
-    # ✅ Generate QR from the correct qr_data
-    qr_content = ticket.qr_data  # "MASTER-EVENTS:{uuid}:{event_id}"
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_H,  # High error correction for better scanning
-        box_size=10,
-        border=4,
-    )
+    qr_content = ticket.qr_data
+    qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=4)
     qr.add_data(qr_content)
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
-
     buffer = BytesIO()
     img.save(buffer, format='PNG')
     buffer.seek(0)
     qr_base64 = base64.b64encode(buffer.getvalue()).decode()
 
-    # ✅ Upload QR to Cloudinary so it persists
     try:
         buffer.seek(0)
         cloudinary_result = cloudinary.uploader.upload(
@@ -89,18 +80,15 @@ def purchase_ticket(request):
         print(f"✅ QR uploaded to Cloudinary: {cloudinary_result['secure_url']}")
     except Exception as e:
         print(f"⚠️ QR Cloudinary upload failed: {e}")
-        # Fall back to saving locally
         from django.core.files.base import ContentFile
         buffer.seek(0)
         ticket.qr_image = ContentFile(buffer.getvalue(), name=f"qr_{ticket.ticket_id}.png")
 
     ticket.save()
 
-    # Update event tickets sold
     event.tickets_sold += data['quantity']
     event.save()
 
-    # Organizer wallet
     organizer_wallet, _ = Wallet.objects.get_or_create(user=event.organizer)
     organizer_amount = total * Decimal('0.95')
     organizer_wallet.balance += organizer_amount
@@ -116,17 +104,14 @@ def purchase_ticket(request):
         status='completed',
     )
 
-    # Email notification
     try:
         notify_ticket_purchase(ticket)
     except Exception as e:
         print(f"Email notification failed: {e}")
 
-    # Serialize response
     ticket_data = TicketSerializer(ticket, context={'request': request}).data
-    ticket_data['qr_base64'] = qr_base64  # also send base64 for instant display
+    ticket_data['qr_base64'] = qr_base64
 
-    # Async NFT mint — doesn't block response
     try:
         owner_wallet = getattr(request.user, 'wallet_address', None)
 
@@ -172,15 +157,12 @@ def transfer_ticket(request):
     if to_user == request.user:
         return Response({'error': 'Cannot transfer to yourself'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # Record transfer
     TicketTransfer.objects.create(ticket=ticket, from_user=request.user, to_user=to_user)
 
-    # Old ticket becomes transferred — QR void
     ticket.owner  = to_user
     ticket.status = 'transferred'
     ticket.save()
 
-    # ✅ New ticket for recipient with fresh QR
     new_ticket = Ticket(
         event=ticket.event,
         owner=to_user,
@@ -190,14 +172,9 @@ def transfer_ticket(request):
         status='active',
         is_resale=True,
     )
-    new_ticket.save()  # new qr_data generated automatically
+    new_ticket.save()
 
-    # Generate new QR for new ticket
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_H,
-        box_size=10, border=4,
-    )
+    qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=4)
     qr.add_data(new_ticket.qr_data)
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
@@ -218,13 +195,11 @@ def transfer_ticket(request):
     except Exception as e:
         print(f"QR upload for transfer failed: {e}")
 
-    # Notifications
     try:
         notify_ticket_transfer(ticket, request.user, to_user)
     except Exception as e:
         print(f"Transfer email failed: {e}")
 
-    # NFT transfer on blockchain
     try:
         if ticket.nft_token_id and to_user.wallet_address:
             from utils.blockchain import transfer_ticket_nft
@@ -236,9 +211,88 @@ def transfer_ticket(request):
         'message': 'Ticket transferred successfully',
         'new_ticket': TicketSerializer(new_ticket, context={'request': request}).data
     })
+
+
+def _find_ticket(qr_data):
+    """Shared ticket lookup used by both verify and public scan."""
+    ticket = None
+
+    # Strategy 1: Dynamic HMAC QR
+    ticket_id_from_qr, _ = verify_dynamic_qr_token(qr_data)
+    if ticket_id_from_qr:
+        try:
+            ticket = Ticket.objects.select_related('event', 'owner').get(ticket_id=ticket_id_from_qr)
+            return ticket
+        except Ticket.DoesNotExist:
+            pass
+
+    # Strategy 2: Static qr_data
+    try:
+        return Ticket.objects.select_related('event', 'owner').get(qr_data=qr_data)
+    except Ticket.DoesNotExist:
+        pass
+
+    # Strategy 3: Direct ticket_id
+    try:
+        return Ticket.objects.select_related('event', 'owner').get(ticket_id=qr_data.upper())
+    except Ticket.DoesNotExist:
+        pass
+
+    # Strategy 4: MASTER-EVENTS UUID format
+    if qr_data.startswith('MASTER-EVENTS:'):
+        try:
+            parts = qr_data.split(':')
+            if len(parts) >= 2:
+                return Ticket.objects.select_related('event', 'owner').get(id=parts[1])
+        except Exception:
+            pass
+
+    return None
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def public_scan_ticket(request):
+    """
+    Public QR scan — anyone with a phone camera can scan.
+    Returns ticket owner info WITHOUT redeeming the ticket.
+    Read-only. Safe to expose publicly.
+    """
+    qr_data = request.data.get('qr_data', '').strip()
+    if not qr_data:
+        return Response({'valid': False, 'reason': 'No QR data provided'}, status=400)
+
+    ticket = _find_ticket(qr_data)
+    if not ticket:
+        return Response({'valid': False, 'reason': 'Ticket not found or QR expired'}, status=404)
+
+    owner = ticket.owner
+    return Response({
+        'valid':        True,
+        'public_scan':  True,
+        'ticket_id':    str(ticket.ticket_id),
+        'status':       ticket.status,
+        'holder_name':  owner.get_full_name() or owner.email,
+        'holder_email': owner.email,
+        'event_name':   ticket.event.name,
+        'event_date':   str(ticket.event.date),
+        'event_venue':  ticket.event.venue,
+        'event_city':   ticket.event.city,
+        'quantity':     ticket.quantity,
+        'is_transfer':  ticket.is_resale,
+        'nft_token_id': ticket.nft_token_id,
+        'redeemed_at':  ticket.redeemed_at,
+        'message':      f"🎟️ Ticket belongs to {owner.get_full_name() or owner.email}",
+    })
+
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def verify_ticket(request):
+    """
+    Door staff / organizer scan — validates AND redeems the ticket.
+    Requires authentication. One-time use.
+    """
     serializer = VerifyTicketSerializer(data=request.data)
     if not serializer.is_valid():
         return Response(serializer.errors, status=400)
@@ -247,48 +301,12 @@ def verify_ticket(request):
     qr_data  = data['qr_data'].strip()
     event_id = data['event_id']
 
-    ticket = None
-
-    # ── Strategy 1: Dynamic HMAC QR (primary — most secure) ──
-    from .serializers import verify_dynamic_qr_token
-    ticket_id_from_qr, event_id_from_qr = verify_dynamic_qr_token(qr_data)
-
-    if ticket_id_from_qr:
-        try:
-            ticket = Ticket.objects.get(ticket_id=ticket_id_from_qr)
-        except Ticket.DoesNotExist:
-            pass
-
-    # ── Strategy 2: Static qr_data fallback (old tickets) ────
-    if not ticket:
-        try:
-            ticket = Ticket.objects.get(qr_data=qr_data)
-        except Ticket.DoesNotExist:
-            pass
-
-    # ── Strategy 3: Manual ticket_id entry ───────────────────
-    if not ticket:
-        try:
-            ticket = Ticket.objects.get(ticket_id=qr_data.upper())
-        except Ticket.DoesNotExist:
-            pass
-
-    # ── Strategy 4: Parse old MASTER-EVENTS UUID format ──────
-    if not ticket and qr_data.startswith('MASTER-EVENTS:'):
-        try:
-            parts = qr_data.split(':')
-            if len(parts) >= 2:
-                ticket = Ticket.objects.get(id=parts[1])
-        except Exception:
-            pass
+    ticket = _find_ticket(qr_data)
 
     if not ticket:
-        return Response(
-            {'valid': False, 'reason': 'Ticket not found or QR expired'},
-            status=404
-        )
+        return Response({'valid': False, 'reason': 'Ticket not found or QR expired'}, status=404)
 
-    # ── Event check ───────────────────────────────────────────
+    # Event check
     if event_id and event_id != 0 and ticket.event.id != event_id:
         return Response({
             'valid':  False,
@@ -296,12 +314,13 @@ def verify_ticket(request):
             'holder': ticket.owner.get_full_name() or ticket.owner.email,
         })
 
-    # ── Status check ──────────────────────────────────────────
+    # Status check
     if ticket.status == 'redeemed':
         return Response({
-            'valid':  False,
-            'reason': 'Already redeemed',
-            'holder': ticket.owner.get_full_name() or ticket.owner.email,
+            'valid':       False,
+            'reason':      'Already redeemed',
+            'holder':      ticket.owner.get_full_name() or ticket.owner.email,
+            'redeemed_at': ticket.redeemed_at,
         })
 
     if ticket.status not in ['active', 'resale']:
@@ -311,7 +330,7 @@ def verify_ticket(request):
             'holder': ticket.owner.get_full_name() or ticket.owner.email,
         })
 
-    # ── Admit ─────────────────────────────────────────────────
+    # ✅ Admit — mark as redeemed
     ticket.status      = 'redeemed'
     ticket.redeemed_at = timezone.now()
     ticket.save()
@@ -319,11 +338,13 @@ def verify_ticket(request):
     return Response({
         'valid':          True,
         'holder':         ticket.owner.get_full_name() or ticket.owner.email,
-        'ticket_id':      ticket.ticket_id,
+        'holder_email':   ticket.owner.email,
+        'ticket_id':      str(ticket.ticket_id),
         'event':          ticket.event.name,
         'quantity':       ticket.quantity,
         'is_transfer':    ticket.is_resale,
         'nft_token_id':   ticket.nft_token_id,
+        'redeemed_at':    ticket.redeemed_at,
         'blockchain_url': get_polygon_explorer_url(ticket.nft_tx_hash) if ticket.nft_tx_hash else None,
     })
 

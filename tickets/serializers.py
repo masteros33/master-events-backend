@@ -10,7 +10,7 @@ from io import BytesIO
 import base64
 
 # ── QR refreshes every 30 seconds ────────────────────────────
-QR_WINDOW_SECONDS = 30
+QR_WINDOW_SECONDS = 10
 
 
 def generate_dynamic_qr_token(ticket):
