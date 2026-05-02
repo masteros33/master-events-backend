@@ -28,8 +28,11 @@ class Ticket(models.Model):
     nft_tx_hash     = models.CharField(max_length=200, blank=True, null=True)
     nft_token_uri   = models.CharField(max_length=500, blank=True, null=True)
     owner_wallet    = models.CharField(max_length=100, blank=True, null=True)
+    payment_reference = models.CharField(max_length=100, blank=True, null=True, unique=True)
+    nft_mint_failed   = models.BooleanField(default=False)
     redeemed_at     = models.DateTimeField(null=True, blank=True)
     created_at      = models.DateTimeField(auto_now_add=True)
+
 
     class Meta:
         db_table = 'tickets'

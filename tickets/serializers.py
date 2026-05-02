@@ -133,11 +133,9 @@ class TransferSerializer(serializers.Serializer):
     ticket_id = serializers.CharField()
     to_email  = serializers.EmailField()
 
-
 class VerifyTicketSerializer(serializers.Serializer):
     qr_data  = serializers.CharField()
-    event_id = serializers.IntegerField()
-
+    event_id = serializers.IntegerField(required=False, default=0)
 
 class DoorStaffCodeSerializer(serializers.ModelSerializer):
     event_name = serializers.CharField(source='event.name', read_only=True)

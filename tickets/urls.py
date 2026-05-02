@@ -10,4 +10,5 @@ urlpatterns = [
     path('door-login/',                       views.door_staff_login,    name='door-staff-login'),
     path('event/<int:event_id>/',             views.event_tickets,       name='event-tickets'),
     path('event/<int:event_id>/door-code/',   views.generate_door_code,  name='generate-door-code'),
+    path('nft/metadata/<str:ticket_id>/', views.nft_metadata, name='nft-metadata'),
 ]
