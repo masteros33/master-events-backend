@@ -18,24 +18,19 @@ from decimal import Decimal
 import random
 import string
 import requests
+from django_ratelimit.decorators import ratelimit
 import qrcode
 from io import BytesIO
 import base64
 import cloudinary.uploader
 
 
-# ── Paystack verification helper ─────────────────────────────
-def verify_paystack_payment(reference, expected_amount_kobo):
-    """
-    Verify payment with Paystack API.
-    Returns True if payment is confirmed and amount matches.
-    """
+# ── Paystack verification ─────────────────────────────────────
+def verify_paystack_payment(reference, expected_amount_pesewas):
     secret_key = getattr(settings, 'PAYSTACK_SECRET_KEY', '')
     if not secret_key:
-        # No Paystack configured — allow in dev, block in prod
-        print("⚠️  PAYSTACK_SECRET_KEY not set — skipping payment verification (dev mode)")
+        print("⚠️ PAYSTACK_SECRET_KEY not set — skipping verification (dev mode)")
         return True
-
     try:
         resp = requests.get(
             f"https://api.paystack.co/transaction/verify/{reference}",
@@ -43,34 +38,25 @@ def verify_paystack_payment(reference, expected_amount_kobo):
             timeout=15,
         )
         data = resp.json()
-
         if not data.get('status'):
             print(f"Paystack verify failed: {data.get('message')}")
             return False
-
         tx = data.get('data', {})
-
         if tx.get('status') != 'success':
             print(f"Paystack payment not successful: {tx.get('status')}")
             return False
-
-        # Amount check — Paystack uses kobo (pesewas for GHS)
         paid_amount = tx.get('amount', 0)
-        if paid_amount < expected_amount_kobo:
-            print(f"Amount mismatch: paid {paid_amount}, expected {expected_amount_kobo}")
+        if paid_amount < expected_amount_pesewas:
+            print(f"Amount mismatch: paid {paid_amount}, expected {expected_amount_pesewas}")
             return False
-
         return True
-
     except Exception as e:
         print(f"Paystack verify error: {e}")
-        # On connection error — fail safe (block purchase)
         return False
 
 
 # ── QR generation helper ──────────────────────────────────────
 def generate_and_upload_qr(ticket):
-    """Generate QR, upload to Cloudinary, return url and base64."""
     qr_content = ticket.qr_data
     qr = qrcode.QRCode(
         version=1,
@@ -80,12 +66,11 @@ def generate_and_upload_qr(ticket):
     )
     qr.add_data(qr_content)
     qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
+    img    = qr.make_image(fill_color="black", back_color="white")
     buffer = BytesIO()
     img.save(buffer, format='PNG')
     buffer.seek(0)
     qr_base64 = base64.b64encode(buffer.getvalue()).decode()
-
     try:
         buffer.seek(0)
         result = cloudinary.uploader.upload(
@@ -103,6 +88,7 @@ def generate_and_upload_qr(ticket):
         return None, qr_base64
 
 
+# ── My tickets ────────────────────────────────────────────────
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def my_tickets(request):
@@ -113,16 +99,25 @@ def my_tickets(request):
     return Response(serializer.data)
 
 
+# ── Purchase ticket ───────────────────────────────────────────
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@ratelimit(key='user', rate='10/m', method='POST', block=False)
 def purchase_ticket(request):
+    if getattr(request, 'limited', False):
+        return Response(
+            {'error': 'Too many purchase attempts. Please wait before trying again.'},
+            status=429
+        )
+
+    # ── Validate request body ─────────────────────────────────
     serializer = PurchaseSerializer(data=request.data)
     if not serializer.is_valid():
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     data = serializer.validated_data
 
-    # ── Step 1: Validate event ────────────────────────────────
+    # ── Validate event ────────────────────────────────────────
     try:
         event = Event.objects.get(pk=data['event_id'], is_active=True, sales_open=True)
     except Event.DoesNotExist:
@@ -138,9 +133,9 @@ def purchase_ticket(request):
         )
 
     total          = Decimal(str(float(event.price) * data['quantity']))
-    total_pesewas  = int(total * 100)  # Paystack uses smallest currency unit
+    total_pesewas  = int(total * 100)
 
-    # ── Step 2: Verify payment with Paystack ─────────────────
+    # ── Verify Paystack payment ───────────────────────────────
     payment_ref = data['payment_reference']
     if not verify_paystack_payment(payment_ref, total_pesewas):
         return Response(
@@ -148,14 +143,14 @@ def purchase_ticket(request):
             status=status.HTTP_402_PAYMENT_REQUIRED
         )
 
-    # ── Step 3: Prevent duplicate purchase with same reference ─
+    # ── Prevent duplicate reference ───────────────────────────
     if Ticket.objects.filter(payment_reference=payment_ref).exists():
         return Response(
             {'error': 'This payment reference has already been used.'},
             status=status.HTTP_409_CONFLICT
         )
 
-    # ── Step 4: Create ticket ─────────────────────────────────
+    # ── Create ticket ─────────────────────────────────────────
     ticket = Ticket(
         event=event,
         owner=request.user,
@@ -167,20 +162,20 @@ def purchase_ticket(request):
     )
     ticket.save()
 
-    # ── Step 5: Generate + upload QR ─────────────────────────
+    # ── Generate + upload QR ──────────────────────────────────
     qr_url, qr_base64 = generate_and_upload_qr(ticket)
     if qr_url:
         ticket.qr_image = qr_url
         ticket.save(update_fields=['qr_image'])
 
-    # ── Step 6: Update event ticket count ─────────────────────
+    # ── Update event sold count ───────────────────────────────
     event.tickets_sold += data['quantity']
     event.save()
 
-    # ── Step 7: Credit organizer wallet (95%) ─────────────────
+    # ── Credit organizer wallet (95%) ─────────────────────────
     organizer_wallet, _ = Wallet.objects.get_or_create(user=event.organizer)
     organizer_amount     = total * Decimal('0.95')
-    organizer_wallet.balance     += organizer_amount
+    organizer_wallet.balance      += organizer_amount
     organizer_wallet.total_earned += organizer_amount
     organizer_wallet.save()
 
@@ -193,17 +188,17 @@ def purchase_ticket(request):
         status='completed',
     )
 
-    # ── Step 8: Send confirmation email ───────────────────────
+    # ── Send confirmation email ───────────────────────────────
     try:
         notify_ticket_purchase(ticket)
     except Exception as e:
         print(f"Email notification failed: {e}")
 
-    # ── Step 9: Return ticket data ────────────────────────────
-    ticket_data             = TicketSerializer(ticket, context={'request': request}).data
+    # ── Build response ────────────────────────────────────────
+    ticket_data              = TicketSerializer(ticket, context={'request': request}).data
     ticket_data['qr_base64'] = qr_base64
 
-    # ── Step 10: Mint NFT in background ──────────────────────
+    # ── Mint NFT in background ────────────────────────────────
     try:
         owner_wallet = getattr(request.user, 'wallet_address', None)
 
@@ -215,7 +210,7 @@ def purchase_ticket(request):
                 t.nft_tx_hash     = nft_result['tx_hash']
                 t.nft_token_uri   = nft_result['token_uri']
                 t.nft_mint_failed = False
-                t.save(update_fields=['nft_token_id', 'nft_tx_hash', 'nft_token_uri', 'nft_mint_failed'])
+                t.save(update_fields=['nft_token_id','nft_tx_hash','nft_token_uri','nft_mint_failed'])
                 print(f"✅ NFT saved for ticket {t.ticket_id}: token={nft_result['token_id']}")
             except Exception as e:
                 print(f"Error saving NFT result: {e}")
@@ -229,9 +224,15 @@ def purchase_ticket(request):
     return Response(ticket_data, status=status.HTTP_201_CREATED)
 
 
+# ── Transfer ticket ───────────────────────────────────────────
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@ratelimit(key='user', rate='5/m', method='POST', block=False)
 def transfer_ticket(request):
+    if getattr(request, 'limited', False):
+        return Response({'error': 'Too many transfer attempts. Please wait.'}, status=429)
+
+    # ── Validate request body ─────────────────────────────────
     serializer = TransferSerializer(data=request.data)
     if not serializer.is_valid():
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -259,17 +260,10 @@ def transfer_ticket(request):
         )
 
     if to_user == request.user:
-        return Response(
-            {'error': 'Cannot transfer to yourself'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
+        return Response({'error': 'Cannot transfer to yourself'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # ── Record transfer history ───────────────────────────────
-    TicketTransfer.objects.create(
-        ticket=ticket,
-        from_user=request.user,
-        to_user=to_user
-    )
+    # ── Record transfer ───────────────────────────────────────
+    TicketTransfer.objects.create(ticket=ticket, from_user=request.user, to_user=to_user)
 
     # ── Void old ticket ───────────────────────────────────────
     ticket.owner  = to_user
@@ -288,7 +282,7 @@ def transfer_ticket(request):
     )
     new_ticket.save()
 
-    # ── Generate new QR for recipient ────────────────────────
+    # ── Generate new QR ───────────────────────────────────────
     qr_url, _ = generate_and_upload_qr(new_ticket)
     if qr_url:
         new_ticket.qr_image = qr_url
@@ -300,7 +294,7 @@ def transfer_ticket(request):
     except Exception as e:
         print(f"Transfer email failed: {e}")
 
-    # ── On-chain NFT transfer (if wallet addresses exist) ─────
+    # ── On-chain NFT transfer ─────────────────────────────────
     try:
         if ticket.nft_token_id and to_user.wallet_address and request.user.wallet_address:
             from utils.blockchain import transfer_ticket_nft
@@ -310,7 +304,6 @@ def transfer_ticket(request):
                 to_user.wallet_address
             )
         elif ticket.nft_token_id:
-            # Mint a new NFT for recipient if no wallet binding
             def on_new_mint(nft_result):
                 try:
                     from tickets.models import Ticket as TicketModel
@@ -318,7 +311,7 @@ def transfer_ticket(request):
                     t.nft_token_id  = nft_result['token_id']
                     t.nft_tx_hash   = nft_result['tx_hash']
                     t.nft_token_uri = nft_result['token_uri']
-                    t.save(update_fields=['nft_token_id', 'nft_tx_hash', 'nft_token_uri'])
+                    t.save(update_fields=['nft_token_id','nft_tx_hash','nft_token_uri'])
                 except Exception as e:
                     print(f"Transfer NFT save error: {e}")
             mint_ticket_nft_async(new_ticket, callback=on_new_mint)
@@ -331,64 +324,51 @@ def transfer_ticket(request):
     })
 
 
+# ── Ticket lookup helper ──────────────────────────────────────
 def _find_ticket(qr_data):
-    """Shared ticket lookup — 4 strategies."""
     # Strategy 1: Dynamic HMAC QR
     ticket_id_from_qr, _ = verify_dynamic_qr_token(qr_data)
     if ticket_id_from_qr:
         try:
-            return Ticket.objects.select_related('event', 'owner').get(
-                ticket_id=ticket_id_from_qr
-            )
+            return Ticket.objects.select_related('event','owner').get(ticket_id=ticket_id_from_qr)
         except Ticket.DoesNotExist:
             pass
-
     # Strategy 2: Static qr_data
     try:
-        return Ticket.objects.select_related('event', 'owner').get(qr_data=qr_data)
+        return Ticket.objects.select_related('event','owner').get(qr_data=qr_data)
     except Ticket.DoesNotExist:
         pass
-
     # Strategy 3: Direct ticket_id
     try:
-        return Ticket.objects.select_related('event', 'owner').get(
-            ticket_id=qr_data.upper()
-        )
+        return Ticket.objects.select_related('event','owner').get(ticket_id=qr_data.upper())
     except Ticket.DoesNotExist:
         pass
-
     # Strategy 4: MASTER-EVENTS UUID format
     if qr_data.startswith('MASTER-EVENTS:'):
         try:
             parts = qr_data.split(':')
             if len(parts) >= 2:
-                return Ticket.objects.select_related('event', 'owner').get(id=parts[1])
+                return Ticket.objects.select_related('event','owner').get(id=parts[1])
         except Exception:
             pass
-
     return None
 
 
+# ── Public scan — read-only ───────────────────────────────────
 @api_view(['POST'])
 @permission_classes([AllowAny])
+@ratelimit(key='ip', rate='30/m', method='POST', block=False)
 def public_scan_ticket(request):
-    """
-    Public QR scan — read-only, no redemption.
-    Shows ticket owner info for anyone with a phone camera.
-    """
+    if getattr(request, 'limited', False):
+        return Response({'error': 'Too many scan attempts.'}, status=429)
+
     qr_data = request.data.get('qr_data', '').strip()
     if not qr_data:
-        return Response(
-            {'valid': False, 'reason': 'No QR data provided'},
-            status=400
-        )
+        return Response({'valid': False, 'reason': 'No QR data provided'}, status=400)
 
     ticket = _find_ticket(qr_data)
     if not ticket:
-        return Response(
-            {'valid': False, 'reason': 'Ticket not found or QR expired'},
-            status=404
-        )
+        return Response({'valid': False, 'reason': 'Ticket not found or QR expired'}, status=404)
 
     owner = ticket.owner
     return Response({
@@ -410,30 +390,28 @@ def public_scan_ticket(request):
     })
 
 
+# ── Verify + redeem — door staff ──────────────────────────────
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@ratelimit(key='user', rate='60/m', method='POST', block=False)
 def verify_ticket(request):
-    """
-    Door staff / organizer scan — validates AND redeems the ticket.
-    Requires authentication. One-time use.
-    """
+    if getattr(request, 'limited', False):
+        return Response({'error': 'Scan rate limit exceeded.'}, status=429)
+
+    # ── Validate request body ─────────────────────────────────
     serializer = VerifyTicketSerializer(data=request.data)
     if not serializer.is_valid():
         return Response(serializer.errors, status=400)
 
-    data    = serializer.validated_data
-    qr_data = data['qr_data'].strip()
+    data     = serializer.validated_data
+    qr_data  = data['qr_data'].strip()
     event_id = data.get('event_id', 0)
 
     ticket = _find_ticket(qr_data)
-
     if not ticket:
-        return Response(
-            {'valid': False, 'reason': 'Ticket not found or QR expired'},
-            status=404
-        )
+        return Response({'valid': False, 'reason': 'Ticket not found or QR expired'}, status=404)
 
-    # Event check
+    # Wrong event
     if event_id and event_id != 0 and ticket.event.id != event_id:
         return Response({
             'valid':      False,
@@ -481,28 +459,24 @@ def verify_ticket(request):
     })
 
 
+# ── Generate door staff code ──────────────────────────────────
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def generate_door_code(request, event_id):
     try:
         event = Event.objects.get(pk=event_id)
     except Event.DoesNotExist:
-        return Response(
-            {'error': f'Event {event_id} not found'},
-            status=status.HTTP_404_NOT_FOUND
-        )
+        return Response({'error': f'Event {event_id} not found'}, status=status.HTTP_404_NOT_FOUND)
 
     if event.organizer != request.user:
-        return Response(
-            {'error': 'You are not the organizer of this event'},
-            status=status.HTTP_403_FORBIDDEN
-        )
+        return Response({'error': 'You are not the organizer of this event'}, status=status.HTTP_403_FORBIDDEN)
 
     code      = 'DOOR-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
     door_code = DoorStaffCode.objects.create(event=event, code=code, created_by=request.user)
     return Response(DoorStaffCodeSerializer(door_code).data, status=status.HTTP_201_CREATED)
 
 
+# ── Door staff login ──────────────────────────────────────────
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def door_staff_login(request):
@@ -510,12 +484,9 @@ def door_staff_login(request):
     try:
         door_code = DoorStaffCode.objects.get(code=code, is_active=True)
     except DoorStaffCode.DoesNotExist:
-        return Response(
-            {'error': 'Invalid or expired door staff code'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
+        return Response({'error': 'Invalid or expired door staff code'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # ── Mark code as used — single use only ──────────────────
+    # Single use — mark inactive
     door_code.is_active = False
     door_code.save(update_fields=['is_active'])
 
@@ -527,6 +498,7 @@ def door_staff_login(request):
     })
 
 
+# ── Event tickets list ────────────────────────────────────────
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def event_tickets(request, event_id):
@@ -534,26 +506,18 @@ def event_tickets(request, event_id):
         event = Event.objects.get(pk=event_id, organizer=request.user)
     except Event.DoesNotExist:
         return Response({'error': 'Event not found'}, status=status.HTTP_404_NOT_FOUND)
-
-    tickets = Ticket.objects.filter(event=event).select_related('owner')
+    tickets    = Ticket.objects.filter(event=event).select_related('owner')
     serializer = TicketSerializer(tickets, many=True, context={'request': request})
     return Response(serializer.data)
 
 
-
-
+# ── NFT metadata endpoint — readable by OpenSea/Polygonscan ──
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def nft_metadata(request, ticket_id):
-    """
-    Public NFT metadata endpoint — readable by OpenSea, Polygonscan.
-    Returns JSON metadata for a ticket's NFT.
-    """
     try:
         ticket = Ticket.objects.select_related('event').get(ticket_id=ticket_id)
     except Ticket.DoesNotExist:
         return Response({'error': 'Not found'}, status=404)
-
     from utils.blockchain import build_ticket_metadata
-    metadata = build_ticket_metadata(ticket)
-    return Response(metadata)
+    return Response(build_ticket_metadata(ticket))
