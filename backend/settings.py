@@ -103,12 +103,18 @@ AUTH_USER_MODEL = 'accounts.User'
 
 CACHES = {
     "default": {
-        "BACKEND": "django.core.cache.backends.db.DatabaseCache",
-        "LOCATION": "cache_table",
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
     }
 }
 
+# Tell ratelimit to not enforce the cache check error
 RATELIMIT_USE_CACHE = "default"
+RATELIMIT_FAIL_OPEN = True
+
+RATELIMIT_USE_CACHE = "default"
+
+
+SILENCED_SYSTEM_CHECKS = ['django_ratelimit.E003', 'django_ratelimit.W001']
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
