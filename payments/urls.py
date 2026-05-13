@@ -6,4 +6,6 @@ urlpatterns = [
     path('withdraw/', views.withdraw, name='withdraw'),
     path('webhook/', views.paystack_webhook, name='paystack-webhook'),
     path('transactions/', views.transaction_history, name='transactions'),
+    path('initialize/', views.initialize_payment, name='initialize_payment'),
+    
 ]
