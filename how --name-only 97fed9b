@@ -1,0 +1,22 @@
+[33mcommit c61e50607651cf5a0a5243ef75bad9096461aee5[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m)[m
+Author: jude Obodai Sai <judeobodaisai@gmail.com>
+Date:   Tue May 19 12:59:59 2026 +0600
+
+    Fix: change qr_image to CharField to accept Cloudinary URLs
+
+accounts/__pycache__/urls.cpython-314.pyc
+accounts/__pycache__/views.cpython-314.pyc
+backend/__pycache__/settings.cpython-314.pyc
+backend/__pycache__/urls.cpython-314.pyc
+logs/error.log
+logs/info.log
+payments/__pycache__/urls.cpython-314.pyc
+payments/__pycache__/views.cpython-314.pyc
+tickets/__pycache__/models.cpython-314.pyc
+tickets/__pycache__/serializers.cpython-314.pyc
+tickets/__pycache__/urls.cpython-314.pyc
+tickets/__pycache__/views.cpython-314.pyc
+tickets/migrations/0005_ticket_nft_mint_failed_ticket_payment_reference_and_more.py
+tickets/migrations/__pycache__/0005_ticket_nft_mint_failed_ticket_payment_reference_and_more.cpython-314.pyc
+tickets/models.py
+utils/__pycache__/blockchain.cpython-314.pyc
