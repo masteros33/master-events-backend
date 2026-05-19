@@ -23,7 +23,7 @@ class Ticket(models.Model):
     qr_data         = models.CharField(max_length=500, unique=True, blank=True)
     is_resale       = models.BooleanField(default=False)
     resale_price    = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
-    qr_image        = models.ImageField(upload_to='qr_codes/', blank=True, null=True)
+    qr_image = models.CharField(max_length=500, blank=True, null=True)
     nft_token_id    = models.BigIntegerField(null=True, blank=True)
     nft_tx_hash     = models.CharField(max_length=200, blank=True, null=True)
     nft_token_uri   = models.CharField(max_length=500, blank=True, null=True)
