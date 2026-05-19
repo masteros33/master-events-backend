@@ -108,38 +108,23 @@ def forgot_password(request):
         # Always return success — don't leak whether email exists
         return Response({'message': 'If an account exists, a reset link has been sent.'})
 
-    token   = default_token_generator.make_token(user)
-    uid     = urlsafe_base64_encode(force_bytes(user.pk))
+    token     = default_token_generator.make_token(user)
+    uid       = urlsafe_base64_encode(force_bytes(user.pk))
     reset_url = f"https://master-events-bi7m.vercel.app/reset-password?uid={uid}&token={token}"
 
-    try:
-        send_mail(
-            subject='Reset Your Master Events Password',
-            message=f'''Hi {user.first_name},
+    # ── Send email in background thread — never blocks the response ──
+    import threading
+    def _send():
+        try:
+            from utils.emails import notify_password_reset
+            notify_password_reset(user, reset_url)
+        except Exception as e:
+            print(f"Password reset email error: {e}")
 
-You requested a password reset for your Master Events account.
+    threading.Thread(target=_send, daemon=True).start()
 
-Click the link below to reset your password:
-{reset_url}
-
-This link expires in 24 hours.
-
-If you did not request this, ignore this email.
-
-— Master Events Team''',
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            recipient_list=[user.email],
-            fail_silently=False,
-        )
-    except Exception as e:
-        print(f"Email error: {e}")
-        return Response(
-            {'error': 'Failed to send email. Try again.'},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-
+    # Return immediately — don't wait for email
     return Response({'message': 'Password reset link sent to your email.'})
-
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
