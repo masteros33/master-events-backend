@@ -244,12 +244,23 @@ def get_client_ip(request):
 
 
 
-
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def test_email(request):
-    from django.core.mail import send_mail
+    from django.core.mail import send_mail, get_connection
     from django.conf import settings
+    
+    # First just return the settings so we can verify them
+    config = {
+        'EMAIL_HOST':      getattr(settings, 'EMAIL_HOST', 'NOT SET'),
+        'EMAIL_PORT':      getattr(settings, 'EMAIL_PORT', 'NOT SET'),
+        'EMAIL_HOST_USER': getattr(settings, 'EMAIL_HOST_USER', 'NOT SET'),
+        'EMAIL_USE_TLS':   getattr(settings, 'EMAIL_USE_TLS', 'NOT SET'),
+        'DEFAULT_FROM':    getattr(settings, 'DEFAULT_FROM_EMAIL', 'NOT SET'),
+        'PASSWORD_SET':    bool(getattr(settings, 'EMAIL_HOST_PASSWORD', '')),
+        'PASSWORD_LEN':    len(getattr(settings, 'EMAIL_HOST_PASSWORD', '')),
+    }
+    
     try:
         send_mail(
             subject='Test Email from Master Events',
@@ -258,13 +269,9 @@ def test_email(request):
             recipient_list=['mastereventgh@gmail.com'],
             fail_silently=False,
         )
-        return Response({
-            'status': 'sent',
-            'EMAIL_HOST': settings.EMAIL_HOST,
-            'EMAIL_PORT': settings.EMAIL_PORT,
-            'EMAIL_HOST_USER': settings.EMAIL_HOST_USER,
-            'EMAIL_USE_TLS': settings.EMAIL_USE_TLS,
-            'FROM': settings.DEFAULT_FROM_EMAIL,
-        })
+        config['email_status'] = 'SENT successfully'
     except Exception as e:
-        return Response({'status': 'failed', 'error': str(e)}, status=500)
+        config['email_status'] = 'FAILED'
+        config['error'] = str(e)
+    
+    return Response(config)
