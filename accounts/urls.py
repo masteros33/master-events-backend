@@ -12,4 +12,5 @@ urlpatterns = [
     path('notifications/read/',  views.mark_all_read,     name='mark-all-read'),
     path('sessions/',            views.active_sessions,   name='active-sessions'),
     path('sessions/revoke/',     views.revoke_all_sessions, name='revoke-sessions'),
+    path('test-email/', views.test_email, name='test-email'),
 ]
