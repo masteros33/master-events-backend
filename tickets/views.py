@@ -521,3 +521,141 @@ def nft_metadata(request, ticket_id):
         return Response({'error': 'Not found'}, status=404)
     from utils.blockchain import build_ticket_metadata
     return Response(build_ticket_metadata(ticket))
+
+
+
+
+    # ── Resale listings ───────────────────────────────────────────
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def resale_listings(request):
+    """Public endpoint — returns all tickets listed for resale"""
+    tickets = Ticket.objects.filter(
+        status='resale'
+    ).select_related('event', 'owner').order_by('-created_at')
+
+    data = []
+    for t in tickets:
+        data.append({
+            'ticket_id':    str(t.ticket_id),
+            'resale_price': float(t.resale_price or 0),
+            'original_price': float(t.price_paid),
+            'quantity':     t.quantity,
+            'is_transfer':  t.is_resale,
+            'nft_token_id': t.nft_token_id,
+            'event': {
+                'id':       t.event.id,
+                'name':     t.event.name,
+                'date':     str(t.event.date),
+                'time':     str(t.event.time) if t.event.time else None,
+                'venue':    t.event.venue,
+                'city':     getattr(t.event, 'city', 'Ghana'),
+                'category': t.event.category,
+                'image':    t.event.image or '',
+            },
+            'seller': t.owner.first_name or 'Anonymous',
+            'listed_at': t.created_at.isoformat(),
+        })
+
+    return Response(data)
+
+
+# ── Buy resale ticket ─────────────────────────────────────────
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def buy_resale_ticket(request):
+    """Purchase a resale ticket — transfers ownership to buyer"""
+    ticket_id     = request.data.get('ticket_id', '')
+    payment_ref   = request.data.get('payment_reference', '')
+
+    if not ticket_id:
+        return Response({'error': 'ticket_id required'}, status=400)
+
+    try:
+        ticket = Ticket.objects.select_related('event', 'owner').get(
+            ticket_id=ticket_id,
+            status='resale',
+        )
+    except Ticket.DoesNotExist:
+        return Response({'error': 'Resale ticket not found or already sold'}, status=404)
+
+    if ticket.owner == request.user:
+        return Response({'error': 'Cannot buy your own ticket'}, status=400)
+
+    # Verify payment
+    resale_pesewas = int((ticket.resale_price or 0) * 100)
+    if resale_pesewas > 0 and not verify_paystack_payment(payment_ref, resale_pesewas):
+        return Response({'error': 'Payment could not be verified'}, status=402)
+
+    # Prevent duplicate
+    if Ticket.objects.filter(payment_reference=payment_ref).exists():
+        return Response({'error': 'Payment reference already used'}, status=409)
+
+    seller = ticket.owner
+
+    # Transfer ticket to buyer
+    old_ticket        = ticket
+    old_ticket.status = 'transferred'
+    old_ticket.save(update_fields=['status'])
+
+    new_ticket = Ticket(
+        event=ticket.event,
+        owner=request.user,
+        original_buyer=ticket.original_buyer,
+        quantity=ticket.quantity,
+        price_paid=ticket.resale_price or ticket.price_paid,
+        payment_reference=payment_ref,
+        status='active',
+        is_resale=True,
+    )
+    new_ticket.save()
+
+    # Generate new QR
+    qr_url, qr_base64 = generate_and_upload_qr(new_ticket)
+    if qr_url:
+        new_ticket.qr_image = qr_url
+        new_ticket.save(update_fields=['qr_image'])
+
+    # Credit seller wallet (98% — 2% platform fee)
+    from payments.models import Wallet, Transaction
+    seller_wallet, _ = Wallet.objects.get_or_create(user=seller)
+    seller_amount     = (ticket.resale_price or Decimal('0')) * Decimal('0.98')
+    seller_wallet.balance      += seller_amount
+    seller_wallet.total_earned += seller_amount
+    seller_wallet.save()
+
+    Transaction.objects.create(
+        wallet=seller_wallet,
+        type='resale_sale',
+        amount=seller_amount,
+        description=f"Resale — {ticket.event.name}",
+        reference=payment_ref,
+        status='completed',
+    )
+
+    # Send emails
+    try:
+        notify_ticket_purchase(new_ticket)
+    except Exception as e:
+        print(f"Resale purchase email failed: {e}")
+
+    ticket_data              = TicketSerializer(new_ticket, context={'request': request}).data
+    ticket_data['qr_base64'] = qr_base64
+
+    # Mint NFT for new owner
+    try:
+        def on_mint(nft_result):
+            try:
+                t = Ticket.objects.get(pk=new_ticket.pk)
+                t.nft_token_id  = nft_result['token_id']
+                t.nft_tx_hash   = nft_result['tx_hash']
+                t.nft_token_uri = nft_result['token_uri']
+                t.save(update_fields=['nft_token_id','nft_tx_hash','nft_token_uri'])
+            except Exception as e:
+                print(f"Resale NFT save error: {e}")
+        mint_ticket_nft_async(new_ticket, callback=on_mint)
+        ticket_data['nft_minting'] = True
+    except Exception as e:
+        print(f"Resale NFT mint failed: {e}")
+
+    return Response(ticket_data, status=201)
