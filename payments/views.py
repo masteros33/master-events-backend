@@ -251,8 +251,9 @@ def paystack_webhook(request):
         sig      = request.headers.get('X-Paystack-Signature', '')
         body     = request.body
         expected = hmac.new(
-            secret_key.encode(), body, hashlib.sha512
+             secret_key.encode('utf-8'), body, hashlib.sha512
         ).hexdigest()
+        
         if sig != expected:
             print("⚠️ Webhook signature mismatch")
             return Response({'status': 'invalid signature'}, status=400)
@@ -266,48 +267,113 @@ def paystack_webhook(request):
     data  = payload.get('data', {})
     print(f"📩 Paystack webhook: {event}")
 
+
     if event == 'charge.success':
-        reference      = data.get('reference', '')
-        amount_pesewas = data.get('amount', 0)
-        amount_ghs     = Decimal(str(amount_pesewas)) / 100
-        print(f"✅ Charge success: ref={reference}, amount=GHS{amount_ghs}")
+      reference      = data.get('reference', '')
+    amount_pesewas = data.get('amount', 0)
+    metadata       = data.get('metadata', {})
+    print(f"✅ Charge success: ref={reference}, amount={amount_pesewas}")
 
-    elif event == 'transfer.success':
-        reference = data.get('reference', '')
+    # ── Skip if ticket already exists for this reference ─────
+    from tickets.models import Ticket
+    if Ticket.objects.filter(payment_reference=reference).exists():
+        print(f"⚠️ Ticket already exists for {reference} — skipping webhook creation")
+        return Response({'status': 'ok'})
+
+    # ── Extract metadata ──────────────────────────────────────
+    try:
+        event_id  = int(metadata.get('event_id', 0))
+        quantity  = int(metadata.get('quantity', 1))
+        user_id   = int(metadata.get('user_id', 0))
+    except (ValueError, TypeError) as e:
+        print(f"⚠️ Webhook metadata parse error: {e}")
+        return Response({'status': 'ok'})
+
+    if not event_id or not user_id:
+        print(f"⚠️ Webhook missing event_id or user_id in metadata")
+        return Response({'status': 'ok'})
+
+    try:
+        from events.models import Event
+        from accounts.models import User
+        from tickets.views import generate_and_upload_qr
+        from utils.emails import notify_ticket_purchase
+        from utils.blockchain import mint_ticket_nft_async
+        from decimal import Decimal
+
+        event_obj = Event.objects.get(pk=event_id)
+        user_obj  = User.objects.get(pk=user_id)
+        amount_ghs = Decimal(str(amount_pesewas)) / 100
+
+        ticket = Ticket(
+            event=event_obj,
+            owner=user_obj,
+            original_buyer=user_obj,
+            quantity=quantity,
+            price_paid=amount_ghs,
+            payment_reference=reference,
+            status='active',
+        )
+        ticket.save()
+
+        # Generate QR
+        qr_url, _ = generate_and_upload_qr(ticket)
+        if qr_url:
+            ticket.qr_image = qr_url
+            ticket.save(update_fields=['qr_image'])
+
+        # Update event sold count
+        event_obj.tickets_sold += quantity
+        event_obj.save(update_fields=['tickets_sold'])
+
+        # Credit organizer wallet
+        from payments.models import Wallet, Transaction
+        organizer_wallet, _ = Wallet.objects.get_or_create(user=event_obj.organizer)
+        organizer_amount = amount_ghs * Decimal('0.95')
+        organizer_wallet.balance      += organizer_amount
+        organizer_wallet.total_earned += organizer_amount
+        organizer_wallet.save()
+
+        Transaction.objects.create(
+            wallet=organizer_wallet,
+            type='sale',
+            amount=organizer_amount,
+            description=f"{quantity}x {event_obj.name} (webhook)",
+            reference=reference,
+            status='completed',
+        )
+
+        # Send confirmation email
         try:
-            txn = Transaction.objects.get(reference=reference)
-            if txn.status != 'completed':
-                txn.status = 'completed'
-                txn.save(update_fields=['status'])
-                print(f"✅ Transfer confirmed: {reference}")
-        except Transaction.DoesNotExist:
-            print(f"⚠️ Transfer webhook: {reference} not found")
+            notify_ticket_purchase(ticket)
+        except Exception as e:
+            print(f"Webhook email failed: {e}")
 
-    elif event == 'transfer.failed':
-        reference = data.get('reference', '')
+        # Mint NFT
         try:
-            txn = Transaction.objects.get(reference=reference)
-            if txn.status == 'pending':
-                wallet = txn.wallet
-                wallet.balance         += txn.amount
-                wallet.total_withdrawn -= txn.amount
-                wallet.save()
-                txn.status = 'failed'
-                txn.save(update_fields=['status'])
-                Transaction.objects.create(
-                    wallet=wallet,
-                    type='refund',
-                    amount=txn.amount,
-                    description=f"Refund — transfer failed ({reference})",
-                    status='completed',
-                )
-                print(f"❌ Transfer failed, refunded: {reference}")
-        except Transaction.DoesNotExist:
-            print(f"⚠️ Transfer failed webhook: {reference} not found")
+            def on_mint(nft_result):
+                try:
+                    t = Ticket.objects.get(pk=ticket.pk)
+                    t.nft_token_id  = nft_result['token_id']
+                    t.nft_tx_hash   = nft_result['tx_hash']
+                    t.nft_token_uri = nft_result['token_uri']
+                    t.save(update_fields=['nft_token_id','nft_tx_hash','nft_token_uri'])
+                except Exception as e:
+                    print(f"Webhook NFT save error: {e}")
+            mint_ticket_nft_async(ticket, callback=on_mint)
+        except Exception as e:
+            print(f"Webhook NFT mint failed: {e}")
 
-    return Response({'status': 'ok'})
+        print(f"✅ Webhook created ticket {ticket.ticket_id} for {user_obj.email}")
 
+    except Event.DoesNotExist:
+        print(f"⚠️ Webhook: event {event_id} not found")
+    except User.DoesNotExist:
+        print(f"⚠️ Webhook: user {user_id} not found")
+    except Exception as e:
+        print(f"⚠️ Webhook ticket creation error: {e}")
 
+   
 # ── Transaction history ───────────────────────────────────────
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
