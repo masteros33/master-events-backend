@@ -243,35 +243,32 @@ def get_client_ip(request):
     return request.META.get('REMOTE_ADDR', 'Unknown')
 
 
-
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def test_email(request):
-    from django.core.mail import send_mail, get_connection
     from django.conf import settings
-    
-    # First just return the settings so we can verify them
+    import resend, threading
+
     config = {
-        'EMAIL_HOST':      getattr(settings, 'EMAIL_HOST', 'NOT SET'),
-        'EMAIL_PORT':      getattr(settings, 'EMAIL_PORT', 'NOT SET'),
-        'EMAIL_HOST_USER': getattr(settings, 'EMAIL_HOST_USER', 'NOT SET'),
-        'EMAIL_USE_TLS':   getattr(settings, 'EMAIL_USE_TLS', 'NOT SET'),
-        'DEFAULT_FROM':    getattr(settings, 'DEFAULT_FROM_EMAIL', 'NOT SET'),
-        'PASSWORD_SET':    bool(getattr(settings, 'EMAIL_HOST_PASSWORD', '')),
-        'PASSWORD_LEN':    len(getattr(settings, 'EMAIL_HOST_PASSWORD', '')),
+        'RESEND_API_KEY_SET': bool(getattr(settings, 'RESEND_API_KEY', '')),
+        'RESEND_KEY_LEN':     len(getattr(settings, 'RESEND_API_KEY', '')),
+        'DEFAULT_FROM':       getattr(settings, 'DEFAULT_FROM_EMAIL', 'NOT SET'),
     }
-    
-    try:
-        send_mail(
-            subject='Test Email from Master Events',
-            message='This is a test email.',
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            recipient_list=['mastereventgh@gmail.com'],
-            fail_silently=False,
-        )
-        config['email_status'] = 'SENT successfully'
-    except Exception as e:
-        config['email_status'] = 'FAILED'
-        config['error'] = str(e)
-    
+
+    def _send():
+        try:
+            resend.api_key = settings.RESEND_API_KEY
+            r = resend.Emails.send({
+                "from":    settings.DEFAULT_FROM_EMAIL,
+                "to":      ["mastereventgh@gmail.com"],
+                "subject": "✅ Master Events — Email Test",
+                "html":    "<h1 style='color:#f5a623'>Master Events email is working! 🎟️</h1>",
+                "text":    "Master Events email is working!",
+            })
+            print(f"✅ Resend test email sent: {r}")
+        except Exception as e:
+            print(f"❌ Resend error: {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
+    config['status'] = 'dispatched — check Render logs + your inbox in 10 seconds'
     return Response(config)
