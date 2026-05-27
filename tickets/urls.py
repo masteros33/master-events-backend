@@ -13,4 +13,6 @@ urlpatterns = [
     path('nft/metadata/<str:ticket_id>/',     views.nft_metadata,        name='nft-metadata'),
     path('resale/',                           views.resale_listings,     name='resale-listings'),
     path('resale/buy/',                       views.buy_resale_ticket,   name='buy-resale-ticket'),
+    path('resale/list/',       views.list_for_resale,  name='list-for-resale'),
+    path('resale/cancel/',     views.cancel_resale,    name='cancel-resale'),
 ]

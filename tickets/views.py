@@ -659,3 +659,72 @@ def buy_resale_ticket(request):
         print(f"Resale NFT mint failed: {e}")
 
     return Response(ticket_data, status=201)
+
+    # ── List ticket for resale ────────────────────────────────────
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def list_for_resale(request):
+    ticket_id    = request.data.get('ticket_id', '')
+    resale_price = request.data.get('resale_price', 0)
+
+    if not ticket_id:
+        return Response({'error': 'ticket_id required'}, status=400)
+
+    try:
+        resale_price = Decimal(str(float(resale_price)))
+    except Exception:
+        return Response({'error': 'Invalid price'}, status=400)
+
+    try:
+        ticket = Ticket.objects.get(
+            ticket_id=ticket_id,
+            owner=request.user,
+            status='active',
+        )
+    except Ticket.DoesNotExist:
+        return Response({'error': 'Ticket not found or not active'}, status=404)
+
+    if resale_price >= ticket.price_paid:
+        return Response(
+            {'error': f'Resale price must be less than original price (GHS {ticket.price_paid})'},
+            status=400
+        )
+
+    if resale_price < ticket.price_paid * Decimal('0.3'):
+        return Response(
+            {'error': f'Minimum resale price: GHS {float(ticket.price_paid) * 0.3:.2f}'},
+            status=400
+        )
+
+    ticket.status       = 'resale'
+    ticket.resale_price = resale_price
+    ticket.save(update_fields=['status', 'resale_price'])
+
+    return Response({
+        'message':      'Ticket listed for resale',
+        'ticket_id':    str(ticket.ticket_id),
+        'resale_price': float(resale_price),
+        'status':       'resale',
+    })
+
+
+# ── Cancel resale listing ─────────────────────────────────────
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def cancel_resale(request):
+    ticket_id = request.data.get('ticket_id', '')
+
+    try:
+        ticket = Ticket.objects.get(
+            ticket_id=ticket_id,
+            owner=request.user,
+            status='resale',
+        )
+    except Ticket.DoesNotExist:
+        return Response({'error': 'Resale listing not found'}, status=404)
+
+    ticket.status       = 'active'
+    ticket.resale_price = None
+    ticket.save(update_fields=['status', 'resale_price'])
+
+    return Response({'message': 'Resale listing cancelled', 'ticket_id': str(ticket.ticket_id)})
