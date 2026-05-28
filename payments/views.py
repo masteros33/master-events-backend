@@ -22,15 +22,10 @@ def get_paystack_headers():
     }
 
 
-# ── Initialize transaction from backend ──────────────────────
+# ── Initialize transaction ────────────────────────────────────
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def initialize_payment(request):
-    """
-    Initialize Paystack transaction server-side using secret key.
-    Returns access_code to frontend — secret key never exposed.
-    This fixes the GHS currency not supported error.
-    """
     amount_raw  = request.data.get('amount', 0)
     event_id    = request.data.get('event_id', '')
     event_name  = request.data.get('event_name', '')
@@ -182,9 +177,9 @@ def withdraw(request):
     if wallet.balance < amount:
         return Response({'error': 'Insufficient balance'}, status=400)
 
-    reference   = f"WD-{str(uuid.uuid4())[:8].upper()}"
-    owner_name  = request.user.get_full_name() or request.user.email
-    secret_key  = getattr(settings, 'PAYSTACK_SECRET_KEY', '')
+    reference  = f"WD-{str(uuid.uuid4())[:8].upper()}"
+    owner_name = request.user.get_full_name() or request.user.email
+    secret_key = getattr(settings, 'PAYSTACK_SECRET_KEY', '')
 
     transfer_code   = None
     transfer_status = "completed"
@@ -251,9 +246,8 @@ def paystack_webhook(request):
         sig      = request.headers.get('X-Paystack-Signature', '')
         body     = request.body
         expected = hmac.new(
-             secret_key.encode('utf-8'), body, hashlib.sha512
+            secret_key.encode('utf-8'), body, hashlib.sha512
         ).hexdigest()
-        
         if sig != expected:
             print("⚠️ Webhook signature mismatch")
             return Response({'status': 'invalid signature'}, status=400)
@@ -267,113 +261,110 @@ def paystack_webhook(request):
     data  = payload.get('data', {})
     print(f"📩 Paystack webhook: {event}")
 
-
     if event == 'charge.success':
-      reference      = data.get('reference', '')
-    amount_pesewas = data.get('amount', 0)
-    metadata       = data.get('metadata', {})
-    print(f"✅ Charge success: ref={reference}, amount={amount_pesewas}")
+        reference      = data.get('reference', '')
+        amount_pesewas = data.get('amount', 0)
+        metadata       = data.get('metadata', {})
+        print(f"✅ Charge success: ref={reference}, amount={amount_pesewas}")
 
-    # ── Skip if ticket already exists for this reference ─────
-    from tickets.models import Ticket
-    if Ticket.objects.filter(payment_reference=reference).exists():
-        print(f"⚠️ Ticket already exists for {reference} — skipping webhook creation")
-        return Response({'status': 'ok'})
+        # Skip if ticket already exists
+        from tickets.models import Ticket
+        if Ticket.objects.filter(payment_reference=reference).exists():
+            print(f"⚠️ Ticket already exists for {reference} — skipping webhook creation")
+            return Response({'status': 'ok'})
 
-    # ── Extract metadata ──────────────────────────────────────
-    try:
-        event_id  = int(metadata.get('event_id', 0))
-        quantity  = int(metadata.get('quantity', 1))
-        user_id   = int(metadata.get('user_id', 0))
-    except (ValueError, TypeError) as e:
-        print(f"⚠️ Webhook metadata parse error: {e}")
-        return Response({'status': 'ok'})
-
-    if not event_id or not user_id:
-        print(f"⚠️ Webhook missing event_id or user_id in metadata")
-        return Response({'status': 'ok'})
-
-    try:
-        from events.models import Event
-        from accounts.models import User
-        from tickets.views import generate_and_upload_qr
-        from utils.emails import notify_ticket_purchase
-        from utils.blockchain import mint_ticket_nft_async
-        from decimal import Decimal
-
-        event_obj = Event.objects.get(pk=event_id)
-        user_obj  = User.objects.get(pk=user_id)
-        amount_ghs = Decimal(str(amount_pesewas)) / 100
-
-        ticket = Ticket(
-            event=event_obj,
-            owner=user_obj,
-            original_buyer=user_obj,
-            quantity=quantity,
-            price_paid=amount_ghs,
-            payment_reference=reference,
-            status='active',
-        )
-        ticket.save()
-
-        # Generate QR
-        qr_url, _ = generate_and_upload_qr(ticket)
-        if qr_url:
-            ticket.qr_image = qr_url
-            ticket.save(update_fields=['qr_image'])
-
-        # Update event sold count
-        event_obj.tickets_sold += quantity
-        event_obj.save(update_fields=['tickets_sold'])
-
-        # Credit organizer wallet
-        from payments.models import Wallet, Transaction
-        organizer_wallet, _ = Wallet.objects.get_or_create(user=event_obj.organizer)
-        organizer_amount = amount_ghs * Decimal('0.95')
-        organizer_wallet.balance      += organizer_amount
-        organizer_wallet.total_earned += organizer_amount
-        organizer_wallet.save()
-
-        Transaction.objects.create(
-            wallet=organizer_wallet,
-            type='sale',
-            amount=organizer_amount,
-            description=f"{quantity}x {event_obj.name} (webhook)",
-            reference=reference,
-            status='completed',
-        )
-
-        # Send confirmation email
         try:
-            notify_ticket_purchase(ticket)
-        except Exception as e:
-            print(f"Webhook email failed: {e}")
+            event_id  = int(metadata.get('event_id', 0))
+            quantity  = int(metadata.get('quantity', 1))
+            user_id   = int(metadata.get('user_id', 0))
+        except (ValueError, TypeError) as e:
+            print(f"⚠️ Webhook metadata parse error: {e}")
+            return Response({'status': 'ok'})
 
-        # Mint NFT
+        if not event_id or not user_id:
+            print(f"⚠️ Webhook missing event_id or user_id in metadata")
+            return Response({'status': 'ok'})
+
         try:
-            def on_mint(nft_result):
-                try:
-                    t = Ticket.objects.get(pk=ticket.pk)
-                    t.nft_token_id  = nft_result['token_id']
-                    t.nft_tx_hash   = nft_result['tx_hash']
-                    t.nft_token_uri = nft_result['token_uri']
-                    t.save(update_fields=['nft_token_id','nft_tx_hash','nft_token_uri'])
-                except Exception as e:
-                    print(f"Webhook NFT save error: {e}")
-            mint_ticket_nft_async(ticket, callback=on_mint)
+            from events.models import Event
+            from accounts.models import User
+            from tickets.views import generate_and_upload_qr
+            from utils.emails import notify_ticket_purchase
+            from utils.blockchain import mint_ticket_nft_async
+
+            event_obj  = Event.objects.get(pk=event_id)
+            user_obj   = User.objects.get(pk=user_id)
+            amount_ghs = Decimal(str(amount_pesewas)) / 100
+
+            ticket = Ticket(
+                event=event_obj,
+                owner=user_obj,
+                original_buyer=user_obj,
+                quantity=quantity,
+                price_paid=amount_ghs,
+                payment_reference=reference,
+                status='active',
+            )
+            ticket.save()
+
+            qr_url, _ = generate_and_upload_qr(ticket)
+            if qr_url:
+                ticket.qr_image = qr_url
+                ticket.save(update_fields=['qr_image'])
+
+            event_obj.tickets_sold += quantity
+            event_obj.save(update_fields=['tickets_sold'])
+
+            organizer_wallet, _ = Wallet.objects.get_or_create(user=event_obj.organizer)
+            organizer_amount = amount_ghs * Decimal('0.95')
+            organizer_wallet.balance      += organizer_amount
+            organizer_wallet.total_earned += organizer_amount
+            organizer_wallet.save()
+
+            Transaction.objects.create(
+                wallet=organizer_wallet,
+                type='sale',
+                amount=organizer_amount,
+                description=f"{quantity}x {event_obj.name} (webhook)",
+                reference=reference,
+                status='completed',
+            )
+
+            try:
+                notify_ticket_purchase(ticket)
+            except Exception as e:
+                print(f"Webhook email failed: {e}")
+
+            try:
+                def on_mint(nft_result):
+                    try:
+                        t = Ticket.objects.get(pk=ticket.pk)
+                        t.nft_token_id  = nft_result['token_id']
+                        t.nft_tx_hash   = nft_result['tx_hash']
+                        t.nft_token_uri = nft_result['token_uri']
+                        t.save(update_fields=['nft_token_id','nft_tx_hash','nft_token_uri'])
+                    except Exception as e:
+                        print(f"Webhook NFT save error: {e}")
+                mint_ticket_nft_async(ticket, callback=on_mint)
+            except Exception as e:
+                print(f"Webhook NFT mint failed: {e}")
+
+            print(f"✅ Webhook created ticket {ticket.ticket_id} for {user_obj.email}")
+
+        except Event.DoesNotExist:
+            print(f"⚠️ Webhook: event {event_id} not found")
+            return Response({'status': 'ok'})
+        except User.DoesNotExist:
+            print(f"⚠️ Webhook: user {user_id} not found")
+            return Response({'status': 'ok'})
         except Exception as e:
-            print(f"Webhook NFT mint failed: {e}")
+            print(f"⚠️ Webhook ticket creation error: {e}")
+            return Response({'status': 'ok'})
 
-        print(f"✅ Webhook created ticket {ticket.ticket_id} for {user_obj.email}")
+    # ── Always return 200 to Paystack ─────────────────────────
+    return Response({'status': 'ok'})
 
-    except Event.DoesNotExist:
-        print(f"⚠️ Webhook: event {event_id} not found")
-    except User.DoesNotExist:
-        print(f"⚠️ Webhook: user {user_id} not found")
-    except Exception as e:
-        print(f"⚠️ Webhook ticket creation error: {e}")
 
-   
 # ── Transaction history ───────────────────────────────────────
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
