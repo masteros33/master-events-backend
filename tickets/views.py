@@ -18,6 +18,7 @@ from decimal import Decimal
 import random
 import string
 import requests
+import threading
 from django_ratelimit.decorators import ratelimit
 import qrcode
 from io import BytesIO
@@ -110,14 +111,12 @@ def purchase_ticket(request):
             status=429
         )
 
-    # ── Validate request body ─────────────────────────────────
     serializer = PurchaseSerializer(data=request.data)
     if not serializer.is_valid():
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     data = serializer.validated_data
 
-    # ── Validate event ────────────────────────────────────────
     try:
         event = Event.objects.get(pk=data['event_id'], is_active=True, sales_open=True)
     except Event.DoesNotExist:
@@ -132,10 +131,9 @@ def purchase_ticket(request):
             status=status.HTTP_400_BAD_REQUEST
         )
 
-    total          = Decimal(str(float(event.price) * data['quantity']))
-    total_pesewas  = int(total * 100)
+    total         = Decimal(str(float(event.price) * data['quantity']))
+    total_pesewas = int(total * 100)
 
-    # ── Verify Paystack payment ───────────────────────────────
     payment_ref = data['payment_reference']
     if not verify_paystack_payment(payment_ref, total_pesewas):
         return Response(
@@ -143,14 +141,12 @@ def purchase_ticket(request):
             status=status.HTTP_402_PAYMENT_REQUIRED
         )
 
-    # ── Prevent duplicate reference ───────────────────────────
     if Ticket.objects.filter(payment_reference=payment_ref).exists():
         return Response(
             {'error': 'This payment reference has already been used.'},
             status=status.HTTP_409_CONFLICT
         )
 
-    # ── Create ticket ─────────────────────────────────────────
     ticket = Ticket(
         event=event,
         owner=request.user,
@@ -162,17 +158,14 @@ def purchase_ticket(request):
     )
     ticket.save()
 
-    # ── Generate + upload QR ──────────────────────────────────
     qr_url, qr_base64 = generate_and_upload_qr(ticket)
     if qr_url:
         ticket.qr_image = qr_url
         ticket.save(update_fields=['qr_image'])
 
-    # ── Update event sold count ───────────────────────────────
     event.tickets_sold += data['quantity']
     event.save()
 
-    # ── Credit organizer wallet (95%) ─────────────────────────
     organizer_wallet, _ = Wallet.objects.get_or_create(user=event.organizer)
     organizer_amount     = total * Decimal('0.95')
     organizer_wallet.balance      += organizer_amount
@@ -188,17 +181,14 @@ def purchase_ticket(request):
         status='completed',
     )
 
-    # ── Send confirmation email ───────────────────────────────
     try:
         notify_ticket_purchase(ticket)
     except Exception as e:
         print(f"Email notification failed: {e}")
 
-    # ── Build response ────────────────────────────────────────
     ticket_data              = TicketSerializer(ticket, context={'request': request}).data
     ticket_data['qr_base64'] = qr_base64
 
-    # ── Mint NFT in background ────────────────────────────────
     try:
         owner_wallet = getattr(request.user, 'wallet_address', None)
 
@@ -232,7 +222,6 @@ def transfer_ticket(request):
     if getattr(request, 'limited', False):
         return Response({'error': 'Too many transfer attempts. Please wait.'}, status=429)
 
-    # ── Validate request body ─────────────────────────────────
     serializer = TransferSerializer(data=request.data)
     if not serializer.is_valid():
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -262,15 +251,12 @@ def transfer_ticket(request):
     if to_user == request.user:
         return Response({'error': 'Cannot transfer to yourself'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # ── Record transfer ───────────────────────────────────────
     TicketTransfer.objects.create(ticket=ticket, from_user=request.user, to_user=to_user)
 
-    # ── Void old ticket ───────────────────────────────────────
     ticket.owner  = to_user
     ticket.status = 'transferred'
     ticket.save()
 
-    # ── Create new ticket for recipient ──────────────────────
     new_ticket = Ticket(
         event=ticket.event,
         owner=to_user,
@@ -282,19 +268,16 @@ def transfer_ticket(request):
     )
     new_ticket.save()
 
-    # ── Generate new QR ───────────────────────────────────────
     qr_url, _ = generate_and_upload_qr(new_ticket)
     if qr_url:
         new_ticket.qr_image = qr_url
         new_ticket.save(update_fields=['qr_image'])
 
-    # ── Notify both parties ───────────────────────────────────
     try:
         notify_ticket_transfer(ticket, request.user, to_user)
     except Exception as e:
         print(f"Transfer email failed: {e}")
 
-    # ── On-chain NFT transfer ─────────────────────────────────
     try:
         if ticket.nft_token_id and to_user.wallet_address and request.user.wallet_address:
             from utils.blockchain import transfer_ticket_nft
@@ -326,24 +309,20 @@ def transfer_ticket(request):
 
 # ── Ticket lookup helper ──────────────────────────────────────
 def _find_ticket(qr_data):
-    # Strategy 1: Dynamic HMAC QR
     ticket_id_from_qr, _ = verify_dynamic_qr_token(qr_data)
     if ticket_id_from_qr:
         try:
             return Ticket.objects.select_related('event','owner').get(ticket_id=ticket_id_from_qr)
         except Ticket.DoesNotExist:
             pass
-    # Strategy 2: Static qr_data
     try:
         return Ticket.objects.select_related('event','owner').get(qr_data=qr_data)
     except Ticket.DoesNotExist:
         pass
-    # Strategy 3: Direct ticket_id
     try:
         return Ticket.objects.select_related('event','owner').get(ticket_id=qr_data.upper())
     except Ticket.DoesNotExist:
         pass
-    # Strategy 4: MASTER-EVENTS UUID format
     if qr_data.startswith('MASTER-EVENTS:'):
         try:
             parts = qr_data.split(':')
@@ -398,7 +377,6 @@ def verify_ticket(request):
     if getattr(request, 'limited', False):
         return Response({'error': 'Scan rate limit exceeded.'}, status=429)
 
-    # ── Validate request body ─────────────────────────────────
     serializer = VerifyTicketSerializer(data=request.data)
     if not serializer.is_valid():
         return Response(serializer.errors, status=400)
@@ -411,7 +389,6 @@ def verify_ticket(request):
     if not ticket:
         return Response({'valid': False, 'reason': 'Ticket not found or QR expired'}, status=404)
 
-    # Wrong event
     if event_id and event_id != 0 and ticket.event.id != event_id:
         return Response({
             'valid':      False,
@@ -420,7 +397,6 @@ def verify_ticket(request):
             'event_name': ticket.event.name,
         })
 
-    # Already redeemed
     if ticket.status == 'redeemed':
         return Response({
             'valid':       False,
@@ -430,7 +406,6 @@ def verify_ticket(request):
             'event_name':  ticket.event.name,
         })
 
-    # Invalid status
     if ticket.status not in ['active', 'resale']:
         return Response({
             'valid':      False,
@@ -439,7 +414,6 @@ def verify_ticket(request):
             'event_name': ticket.event.name,
         })
 
-    # ✅ Admit
     ticket.status      = 'redeemed'
     ticket.redeemed_at = timezone.now()
     ticket.save()
@@ -486,7 +460,6 @@ def door_staff_login(request):
     except DoorStaffCode.DoesNotExist:
         return Response({'error': 'Invalid or expired door staff code'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # Single use — mark inactive
     door_code.is_active = False
     door_code.save(update_fields=['is_active'])
 
@@ -511,7 +484,7 @@ def event_tickets(request, event_id):
     return Response(serializer.data)
 
 
-# ── NFT metadata endpoint — readable by OpenSea/Polygonscan ──
+# ── NFT metadata endpoint ─────────────────────────────────────
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def nft_metadata(request, ticket_id):
@@ -523,13 +496,10 @@ def nft_metadata(request, ticket_id):
     return Response(build_ticket_metadata(ticket))
 
 
-
-
-    # ── Resale listings ───────────────────────────────────────────
+# ── Resale listings ───────────────────────────────────────────
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def resale_listings(request):
-    """Public endpoint — returns all tickets listed for resale"""
     tickets = Ticket.objects.filter(
         status='resale'
     ).select_related('event', 'owner').order_by('-created_at')
@@ -537,12 +507,12 @@ def resale_listings(request):
     data = []
     for t in tickets:
         data.append({
-            'ticket_id':    str(t.ticket_id),
-            'resale_price': float(t.resale_price or 0),
+            'ticket_id':      str(t.ticket_id),
+            'resale_price':   float(t.resale_price or 0),
             'original_price': float(t.price_paid),
-            'quantity':     t.quantity,
-            'is_transfer':  t.is_resale,
-            'nft_token_id': t.nft_token_id,
+            'quantity':       t.quantity,
+            'is_transfer':    t.is_resale,
+            'nft_token_id':   t.nft_token_id,
             'event': {
                 'id':       t.event.id,
                 'name':     t.event.name,
@@ -553,7 +523,7 @@ def resale_listings(request):
                 'category': t.event.category,
                 'image':    t.event.image or '',
             },
-            'seller': t.owner.first_name or 'Anonymous',
+            'seller':    t.owner.first_name or 'Anonymous',
             'listed_at': t.created_at.isoformat(),
         })
 
@@ -564,9 +534,8 @@ def resale_listings(request):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def buy_resale_ticket(request):
-    """Purchase a resale ticket — transfers ownership to buyer"""
-    ticket_id     = request.data.get('ticket_id', '')
-    payment_ref   = request.data.get('payment_reference', '')
+    ticket_id   = request.data.get('ticket_id', '')
+    payment_ref = request.data.get('payment_reference', '')
 
     if not ticket_id:
         return Response({'error': 'ticket_id required'}, status=400)
@@ -582,18 +551,15 @@ def buy_resale_ticket(request):
     if ticket.owner == request.user:
         return Response({'error': 'Cannot buy your own ticket'}, status=400)
 
-    # Verify payment
     resale_pesewas = int((ticket.resale_price or 0) * 100)
     if resale_pesewas > 0 and not verify_paystack_payment(payment_ref, resale_pesewas):
         return Response({'error': 'Payment could not be verified'}, status=402)
 
-    # Prevent duplicate
     if Ticket.objects.filter(payment_reference=payment_ref).exists():
         return Response({'error': 'Payment reference already used'}, status=409)
 
     seller = ticket.owner
 
-    # Transfer ticket to buyer
     old_ticket        = ticket
     old_ticket.status = 'transferred'
     old_ticket.save(update_fields=['status'])
@@ -610,14 +576,11 @@ def buy_resale_ticket(request):
     )
     new_ticket.save()
 
-    # Generate new QR
     qr_url, qr_base64 = generate_and_upload_qr(new_ticket)
     if qr_url:
         new_ticket.qr_image = qr_url
         new_ticket.save(update_fields=['qr_image'])
 
-    # Credit seller wallet (98% — 2% platform fee)
-    from payments.models import Wallet, Transaction
     seller_wallet, _ = Wallet.objects.get_or_create(user=seller)
     seller_amount     = (ticket.resale_price or Decimal('0')) * Decimal('0.98')
     seller_wallet.balance      += seller_amount
@@ -633,16 +596,34 @@ def buy_resale_ticket(request):
         status='completed',
     )
 
-    # Send emails
+    # ── Notify buyer ──────────────────────────────────────────
     try:
         notify_ticket_purchase(new_ticket)
     except Exception as e:
         print(f"Resale purchase email failed: {e}")
 
+    # ── Notify seller their ticket sold ───────────────────────
+    try:
+        from utils.emails import send_notification
+        def _notify_seller():
+            send_notification(
+                user=seller,
+                type='resale_sold',
+                title='Your Ticket Sold! 💰',
+                body=(
+                    f"Hi {seller.first_name},\n\n"
+                    f"Your resale ticket for {ticket.event.name} just sold!\n\n"
+                    f"💰 GHS {float(seller_amount):.2f} added to your wallet (98% payout).\n"
+                    f"Withdraw anytime from your Wallet tab."
+                ),
+            )
+        threading.Thread(target=_notify_seller, daemon=True).start()
+    except Exception as e:
+        print(f"Resale sold notification failed: {e}")
+
     ticket_data              = TicketSerializer(new_ticket, context={'request': request}).data
     ticket_data['qr_base64'] = qr_base64
 
-    # Mint NFT for new owner
     try:
         def on_mint(nft_result):
             try:
@@ -700,6 +681,17 @@ def list_for_resale(request):
     ticket.status       = 'resale'
     ticket.resale_price = resale_price
     ticket.save(update_fields=['status', 'resale_price'])
+
+    # ── Notify seller listing is live ─────────────────────────
+    try:
+        from utils.emails import notify_resale_listed
+        threading.Thread(
+            target=notify_resale_listed,
+            args=(ticket, request.user),
+            daemon=True
+        ).start()
+    except Exception as e:
+        print(f"Resale listed email failed: {e}")
 
     return Response({
         'message':      'Ticket listed for resale',
