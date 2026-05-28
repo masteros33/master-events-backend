@@ -6,13 +6,11 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth.tokens import default_token_generator
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
-from django.core.mail import send_mail
 from django.conf import settings
-from django.views.decorators.cache import never_cache
 from django_ratelimit.decorators import ratelimit
-from django_ratelimit.exceptions import Ratelimited
 from .serializers import RegisterSerializer, LoginSerializer, UserSerializer
 from .models import Notification, User
+import threading
 
 
 def get_tokens(user):
@@ -39,8 +37,18 @@ def register(request):
 
     serializer = RegisterSerializer(data=request.data)
     if serializer.is_valid():
-        user = serializer.save()
+        user   = serializer.save()
         tokens = get_tokens(user)
+
+        # Send welcome email in background
+        def _welcome():
+            try:
+                from utils.emails import notify_welcome
+                notify_welcome(user)
+            except Exception as e:
+                print(f"Welcome email failed: {e}")
+        threading.Thread(target=_welcome, daemon=True).start()
+
         return Response({
             'user':   UserSerializer(user).data,
             'tokens': tokens,
@@ -53,17 +61,12 @@ def register(request):
 @ratelimit(key='ip', rate='10/m', method='POST', block=False)
 @ratelimit(key='post:email', rate='5/m', method='POST', block=False)
 def login(request):
-    """
-    Rate limited:
-    - 10 attempts per minute per IP
-    - 5 attempts per minute per email (prevents targeted brute force)
-    """
     if getattr(request, 'limited', False):
         return rate_limited_response()
 
     serializer = LoginSerializer(data=request.data)
     if serializer.is_valid():
-        user = serializer.validated_data['user']
+        user   = serializer.validated_data['user']
         tokens = get_tokens(user)
         return Response({
             'user':   UserSerializer(user).data,
@@ -105,26 +108,22 @@ def forgot_password(request):
     try:
         user = User.objects.get(email=email)
     except User.DoesNotExist:
-        # Always return success — don't leak whether email exists
         return Response({'message': 'If an account exists, a reset link has been sent.'})
 
     token     = default_token_generator.make_token(user)
     uid       = urlsafe_base64_encode(force_bytes(user.pk))
     reset_url = f"https://master-events-bi7m.vercel.app/reset-password?uid={uid}&token={token}"
 
-    # ── Send email in background thread — never blocks the response ──
-    import threading
     def _send():
         try:
             from utils.emails import notify_password_reset
             notify_password_reset(user, reset_url)
         except Exception as e:
             print(f"Password reset email error: {e}")
-
     threading.Thread(target=_send, daemon=True).start()
 
-    # Return immediately — don't wait for email
     return Response({'message': 'Password reset link sent to your email.'})
+
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -185,19 +184,13 @@ def mark_all_read(request):
     return Response({'message': 'All marked as read'})
 
 
-# ── Session management ────────────────────────────────────────
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def active_sessions(request):
-    """
-    Returns info about the current session.
-    In a full implementation this would list all active tokens.
-    For now returns current token info + last login.
-    """
     return Response({
         'email':       request.user.email,
         'last_login':  request.user.last_login,
-        'is_verified': request.user.is_verified,
+        'is_verified': getattr(request.user, 'is_verified', False),
         'role':        request.user.role,
         'sessions': [{
             'id':         'current',
@@ -213,15 +206,10 @@ def active_sessions(request):
 @permission_classes([IsAuthenticated])
 @ratelimit(key='user', rate='3/m', method='POST', block=False)
 def revoke_all_sessions(request):
-    """
-    Logs out all sessions by rotating the user's password hash.
-    This invalidates all existing JWT tokens.
-    """
     if getattr(request, 'limited', False):
         return rate_limited_response()
 
     try:
-        # Blacklist current refresh token if provided
         refresh_token = request.data.get('refresh')
         if refresh_token:
             token = RefreshToken(refresh_token)
@@ -229,10 +217,8 @@ def revoke_all_sessions(request):
     except Exception:
         pass
 
-    # Rotate the password hash salt — invalidates ALL existing tokens
     request.user.set_password(request.user.password)
     request.user.save(update_fields=['password'])
-
     return Response({'message': 'All sessions revoked. Please log in again.'})
 
 
@@ -246,9 +232,7 @@ def get_client_ip(request):
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def test_email(request):
-    from django.conf import settings
-    import resend, threading
-
+    import resend
     config = {
         'RESEND_API_KEY_SET': bool(getattr(settings, 'RESEND_API_KEY', '')),
         'RESEND_KEY_LEN':     len(getattr(settings, 'RESEND_API_KEY', '')),

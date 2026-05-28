@@ -660,7 +660,8 @@ def buy_resale_ticket(request):
 
     return Response(ticket_data, status=201)
 
-    # ── List ticket for resale ────────────────────────────────────
+
+# ── List ticket for resale ────────────────────────────────────
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def list_for_resale(request):
