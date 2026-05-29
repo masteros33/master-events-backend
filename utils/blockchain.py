@@ -5,7 +5,7 @@ import time
 from web3 import Web3
 from django.conf import settings
 
-POLYGON_RPC = "https://polygon-mainnet.g.alchemy.com/v2/6ua2Hv6WiSZEaByN7SuxD"
+POLYGON_RPC = "https://polygon-amoy.g.alchemy.com/v2/6ua2Hv6WiSZEaByN7SuxD"
 
 try:
     w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
@@ -192,7 +192,7 @@ def mint_ticket_nft(ticket, owner_wallet_address=None, max_retries=3):
                 'nonce':    nonce,
                 'gas':      gas_limit,
                 'gasPrice': gas_price,
-                'chainId':  137,
+                'chainId':  80002,
             })
 
             signed_txn = w3.eth.account.sign_transaction(txn, settings.BLOCKCHAIN_PRIVATE_KEY)
@@ -312,7 +312,7 @@ def transfer_ticket_nft(token_id, from_wallet, to_wallet):
             'nonce':    nonce,
             'gas':      gas_limit,
             'gasPrice': gas_price,
-            'chainId':  137,
+            'chainId':  80002,
         })
 
         signed_txn = w3.eth.account.sign_transaction(txn, settings.BLOCKCHAIN_PRIVATE_KEY)
@@ -347,4 +347,4 @@ def verify_ticket_ownership(token_id, wallet_address):
 def get_polygon_explorer_url(tx_hash):
     if not tx_hash:
         return None
-    return "https://polygonscan.com/tx/" + tx_hash
+    return "https://amoy.polygonscan.com/tx/" + tx_hash
