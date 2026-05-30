@@ -3,6 +3,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
+from django.contrib.auth import authenticate
 from django.contrib.auth.tokens import default_token_generator
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
@@ -40,7 +41,6 @@ def register(request):
         user   = serializer.save()
         tokens = get_tokens(user)
 
-        # Send welcome email in background
         def _welcome():
             try:
                 from utils.emails import notify_welcome
@@ -208,7 +208,6 @@ def active_sessions(request):
 def revoke_all_sessions(request):
     if getattr(request, 'limited', False):
         return rate_limited_response()
-
     try:
         refresh_token = request.data.get('refresh')
         if refresh_token:
@@ -216,10 +215,24 @@ def revoke_all_sessions(request):
             token.blacklist()
     except Exception:
         pass
-
     request.user.set_password(request.user.password)
     request.user.save(update_fields=['password'])
     return Response({'message': 'All sessions revoked. Please log in again.'})
+
+
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def delete_account(request):
+    """Requires password confirmation before deleting"""
+    password = request.data.get('password', '')
+    if not password:
+        return Response({'error': 'Password is required to delete account'}, status=400)
+    if not request.user.check_password(password):
+        return Response({'error': 'Incorrect password'}, status=400)
+    email = request.user.email
+    request.user.delete()
+    print(f"✅ Account deleted: {email}")
+    return Response({'message': 'Account deleted successfully'})
 
 
 def get_client_ip(request):
@@ -256,3 +269,189 @@ def test_email(request):
     threading.Thread(target=_send, daemon=True).start()
     config['status'] = 'dispatched — check Render logs + your inbox in 10 seconds'
     return Response(config)
+
+
+# ── Admin login — FIXED (was indented inside test_email) ──────
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def admin_login(request):
+    email    = request.data.get('email', '').strip()
+    password = request.data.get('password', '')
+    if not email or not password:
+        return Response({'error': 'Email and password required'}, status=400)
+
+    user = authenticate(request, email=email, password=password)
+    if user and user.role == 'super_admin':
+        tokens = get_tokens(user)
+        return Response({
+            'tokens': tokens,
+            'user': {
+                'id':         user.id,
+                'email':      user.email,
+                'first_name': user.first_name,
+                'last_name':  user.last_name,
+                'role':       user.role,
+            }
+        })
+    return Response(
+        {'error': 'Invalid credentials or insufficient permissions'},
+        status=401
+    )
+
+
+# ── Super Admin: platform overview ───────────────────────────
+def is_super_admin(user):
+    return user.is_authenticated and user.role == 'super_admin'
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def admin_overview(request):
+    if not is_super_admin(request.user):
+        return Response({'error': 'Forbidden'}, status=403)
+
+    from events.models import Event
+    from tickets.models import Ticket
+    from payments.models import Wallet, Transaction
+
+    total_users      = User.objects.count()
+    total_attendees  = User.objects.filter(role='attendee').count()
+    total_organizers = User.objects.filter(role='organizer').count()
+    total_events     = Event.objects.count()
+    active_events    = Event.objects.filter(sales_open=True, is_active=True).count()
+    total_tickets    = Ticket.objects.count()
+    total_revenue    = sum(
+        float(w.total_earned)
+        for w in Wallet.objects.all()
+    )
+    total_withdrawn  = sum(
+        float(w.total_withdrawn)
+        for w in Wallet.objects.all()
+    )
+
+    return Response({
+        'users': {
+            'total':      total_users,
+            'attendees':  total_attendees,
+            'organizers': total_organizers,
+        },
+        'events': {
+            'total':  total_events,
+            'active': active_events,
+        },
+        'tickets': {
+            'total': total_tickets,
+        },
+        'revenue': {
+            'total_earned':    round(total_revenue, 2),
+            'total_withdrawn': round(total_withdrawn, 2),
+            'platform_fees':   round(total_revenue * 0.05, 2),
+        },
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def admin_organizers(request):
+    if not is_super_admin(request.user):
+        return Response({'error': 'Forbidden'}, status=403)
+
+    from events.models import Event
+    from payments.models import Wallet
+
+    organizers = User.objects.filter(role='organizer').order_by('-date_joined')
+    data = []
+    for org in organizers:
+        events  = Event.objects.filter(organizer=org)
+        wallet  = Wallet.objects.filter(user=org).first()
+        data.append({
+            'id':           org.id,
+            'name':         org.full_name,
+            'email':        org.email,
+            'phone':        org.phone,
+            'is_verified':  org.is_verified,
+            'is_suspended': getattr(org, 'is_suspended', False),
+            'joined':       org.date_joined.isoformat(),
+            'events_count': events.count(),
+            'tickets_sold': sum(e.tickets_sold for e in events),
+            'total_earned': float(wallet.total_earned) if wallet else 0,
+            'balance':      float(wallet.balance) if wallet else 0,
+        })
+    return Response(data)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def admin_events(request):
+    if not is_super_admin(request.user):
+        return Response({'error': 'Forbidden'}, status=403)
+
+    from events.models import Event
+    events = Event.objects.select_related('organizer').order_by('-created_at')[:100]
+    data = [{
+        'id':            e.id,
+        'name':          e.name,
+        'organizer':     e.organizer.full_name,
+        'organizer_email': e.organizer.email,
+        'date':          str(e.date),
+        'venue':         e.venue,
+        'category':      e.category,
+        'price':         float(e.price),
+        'total_tickets': e.total_tickets,
+        'tickets_sold':  e.tickets_sold,
+        'sales_open':    e.sales_open,
+        'is_active':     e.is_active,
+        'revenue':       round(float(e.price) * e.tickets_sold * 0.95, 2),
+    } for e in events]
+    return Response(data)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def admin_transactions(request):
+    if not is_super_admin(request.user):
+        return Response({'error': 'Forbidden'}, status=403)
+
+    from payments.models import Transaction
+    txns = Transaction.objects.select_related('wallet__user').order_by('-created_at')[:200]
+    data = [{
+        'id':          t.id,
+        'type':        t.type,
+        'amount':      float(t.amount),
+        'description': t.description,
+        'reference':   t.reference,
+        'status':      t.status,
+        'user':        t.wallet.user.email if t.wallet else 'N/A',
+        'created_at':  t.created_at.isoformat(),
+    } for t in txns]
+    return Response(data)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def admin_suspend_user(request, user_id):
+    if not is_super_admin(request.user):
+        return Response({'error': 'Forbidden'}, status=403)
+    try:
+        user = User.objects.get(pk=user_id)
+    except User.DoesNotExist:
+        return Response({'error': 'User not found'}, status=404)
+    user.is_suspended = not getattr(user, 'is_suspended', False)
+    user.save(update_fields=['is_suspended'])
+    action = 'suspended' if user.is_suspended else 'reinstated'
+    return Response({'message': f'User {action}', 'is_suspended': user.is_suspended})
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def admin_toggle_event(request, event_id):
+    if not is_super_admin(request.user):
+        return Response({'error': 'Forbidden'}, status=403)
+    from events.models import Event
+    try:
+        event = Event.objects.get(pk=event_id)
+    except Event.DoesNotExist:
+        return Response({'error': 'Event not found'}, status=404)
+    event.is_active = not event.is_active
+    event.save(update_fields=['is_active'])
+    return Response({'message': f'Event {"activated" if event.is_active else "deactivated"}', 'is_active': event.is_active})

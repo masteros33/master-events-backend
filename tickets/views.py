@@ -454,21 +454,22 @@ def generate_door_code(request, event_id):
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def door_staff_login(request):
-    code = request.data.get('code', '').upper().strip()
+    code = request.data.get('code', '').strip().upper()
+    if not code:
+        return Response({'valid': False, 'error': 'Code is required'}, status=400)
     try:
-        door_code = DoorStaffCode.objects.get(code=code, is_active=True)
+        door_code = DoorStaffCode.objects.select_related('event').get(
+            code=code,
+            is_active=True
+        )
+        return Response({
+            'valid':      True,
+            'event_id':   door_code.event.id,
+            'event_name': door_code.event.name,
+            'code':       code,
+        })
     except DoorStaffCode.DoesNotExist:
-        return Response({'error': 'Invalid or expired door staff code'}, status=status.HTTP_400_BAD_REQUEST)
-
-    door_code.is_active = False
-    door_code.save(update_fields=['is_active'])
-
-    return Response({
-        'valid':      True,
-        'event_id':   door_code.event.id,
-        'event_name': door_code.event.name,
-        'code':       door_code.code,
-    })
+        return Response({'valid': False, 'error': 'Invalid or expired code'}, status=400)
 
 
 # ── Event tickets list ────────────────────────────────────────

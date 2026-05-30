@@ -373,3 +373,99 @@ def transaction_history(request):
     transactions = wallet.transactions.all()[:20]
     serializer   = TransactionSerializer(transactions, many=True)
     return Response(serializer.data)
+
+
+
+# ── Add these two views at the bottom of payments/views.py ────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def attendee_wallet_detail(request):
+    from .models import AttendeeWallet, Transaction
+    wallet, _ = AttendeeWallet.objects.get_or_create(user=request.user)
+    transactions = Transaction.objects.filter(att_wallet=wallet).order_by('-created_at')[:20]
+    return Response({
+        'balance':         float(wallet.balance),
+        'total_earned':    float(wallet.total_earned),
+        'total_withdrawn': float(wallet.total_withdrawn),
+        'transactions': [{
+            'type':        t.type,
+            'amount':      float(t.amount),
+            'description': t.description,
+            'reference':   t.reference,
+            'status':      t.status,
+            'created_at':  t.created_at.isoformat(),
+        } for t in transactions],
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def attendee_withdraw(request):
+    from .models import AttendeeWallet, Transaction
+    amount_raw = request.data.get('amount', 0)
+    method     = request.data.get('method', 'momo')
+    account    = request.data.get('account', '').strip()
+
+    try:
+        amount = Decimal(str(float(amount_raw)))
+    except Exception:
+        return Response({'error': 'Invalid amount'}, status=400)
+
+    if amount < 10:
+        return Response({'error': 'Minimum withdrawal is GHS 10'}, status=400)
+    if not account:
+        return Response({'error': 'Account number is required'}, status=400)
+
+    wallet, _ = AttendeeWallet.objects.get_or_create(user=request.user)
+    if wallet.balance < amount:
+        return Response({'error': 'Insufficient balance'}, status=400)
+
+    reference    = f"AWD-{str(uuid.uuid4())[:8].upper()}"
+    owner_name   = request.user.get_full_name() or request.user.email
+    secret_key   = getattr(settings, 'PAYSTACK_SECRET_KEY', '')
+    transfer_code = None
+    tx_status    = 'completed'
+
+    if secret_key:
+        recipient_code = resolve_momo_recipient(account, owner_name)
+        if recipient_code:
+            success, transfer_code, ps_status = initiate_paystack_transfer(
+                amount_ghs=amount,
+                recipient_code=recipient_code,
+                reference=reference,
+                reason=f"Master Events resale payout — {owner_name}",
+            )
+            if not success:
+                return Response({'error': f'Payout failed: {ps_status}'}, status=400)
+            tx_status = 'completed' if ps_status == 'success' else 'pending'
+        else:
+            tx_status = 'pending'
+    else:
+        print("⚠️ No PAYSTACK key — simulating attendee withdrawal")
+
+    wallet.balance         -= amount
+    wallet.total_withdrawn += amount
+    wallet.save()
+
+    Transaction.objects.create(
+        att_wallet=wallet,
+        type='withdrawal',
+        amount=amount,
+        description=f"Resale withdrawal via {'MoMo' if method == 'momo' else 'Bank'} to {account}",
+        reference=reference,
+        status=tx_status,
+    )
+
+    try:
+        notify_withdrawal(wallet, float(amount), method, reference)
+    except Exception as e:
+        print(f"Attendee withdrawal email failed: {e}")
+
+    return Response({
+        'message':     'Withdrawal initiated' if tx_status == 'pending' else 'Withdrawal completed',
+        'amount':      float(amount),
+        'reference':   reference,
+        'status':      tx_status,
+        'new_balance': float(wallet.balance),
+    })
