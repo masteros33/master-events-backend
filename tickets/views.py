@@ -195,13 +195,16 @@ def purchase_ticket(request):
         def on_mint_success(nft_result):
             try:
                 from tickets.models import Ticket as TicketModel
+                from utils.emails import notify_nft_minted
                 t = TicketModel.objects.get(pk=ticket.pk)
                 t.nft_token_id    = nft_result['token_id']
                 t.nft_tx_hash     = nft_result['tx_hash']
                 t.nft_token_uri   = nft_result['token_uri']
                 t.nft_mint_failed = False
-                t.save(update_fields=['nft_token_id','nft_tx_hash','nft_token_uri','nft_mint_failed'])
+                t.save(update_fields=['nft_token_id', 'nft_tx_hash', 'nft_token_uri', 'nft_mint_failed'])
                 print(f"✅ NFT saved for ticket {t.ticket_id}: token={nft_result['token_id']}")
+                # ── Send NFT confirmed email ──────────────────
+                threading.Thread(target=notify_nft_minted, args=(t,), daemon=True).start()
             except Exception as e:
                 print(f"Error saving NFT result: {e}")
 
@@ -294,7 +297,7 @@ def transfer_ticket(request):
                     t.nft_token_id  = nft_result['token_id']
                     t.nft_tx_hash   = nft_result['tx_hash']
                     t.nft_token_uri = nft_result['token_uri']
-                    t.save(update_fields=['nft_token_id','nft_tx_hash','nft_token_uri'])
+                    t.save(update_fields=['nft_token_id', 'nft_tx_hash', 'nft_token_uri'])
                 except Exception as e:
                     print(f"Transfer NFT save error: {e}")
             mint_ticket_nft_async(new_ticket, callback=on_new_mint)
@@ -312,22 +315,22 @@ def _find_ticket(qr_data):
     ticket_id_from_qr, _ = verify_dynamic_qr_token(qr_data)
     if ticket_id_from_qr:
         try:
-            return Ticket.objects.select_related('event','owner').get(ticket_id=ticket_id_from_qr)
+            return Ticket.objects.select_related('event', 'owner').get(ticket_id=ticket_id_from_qr)
         except Ticket.DoesNotExist:
             pass
     try:
-        return Ticket.objects.select_related('event','owner').get(qr_data=qr_data)
+        return Ticket.objects.select_related('event', 'owner').get(qr_data=qr_data)
     except Ticket.DoesNotExist:
         pass
     try:
-        return Ticket.objects.select_related('event','owner').get(ticket_id=qr_data.upper())
+        return Ticket.objects.select_related('event', 'owner').get(ticket_id=qr_data.upper())
     except Ticket.DoesNotExist:
         pass
     if qr_data.startswith('MASTER-EVENTS:'):
         try:
             parts = qr_data.split(':')
             if len(parts) >= 2:
-                return Ticket.objects.select_related('event','owner').get(id=parts[1])
+                return Ticket.objects.select_related('event', 'owner').get(id=parts[1])
         except Exception:
             pass
     return None
@@ -418,6 +421,29 @@ def verify_ticket(request):
     ticket.redeemed_at = timezone.now()
     ticket.save()
 
+    # ── Notify ticket owner they were admitted ────────────────
+    try:
+        from utils.emails import send_notification
+        threading.Thread(
+            target=send_notification,
+            kwargs=dict(
+                user=ticket.owner,
+                type='ticket_redeemed',
+                title='Ticket Scanned — Enjoy the Event! 🎉',
+                body=(
+                    f"Hi {ticket.owner.first_name},\n\n"
+                    f"Your ticket for {ticket.event.name} was just scanned at the gate.\n\n"
+                    f"📅 {ticket.event.date} · 📍 {ticket.event.venue}\n\n"
+                    f"Enjoy the event! 🎉"
+                ),
+                send_email=True,
+                icon="🎉",
+            ),
+            daemon=True
+        ).start()
+    except Exception as e:
+        print(f"Redeem notification failed: {e}")
+
     return Response({
         'valid':          True,
         'holder':         ticket.owner.get_full_name() or ticket.owner.email,
@@ -447,6 +473,18 @@ def generate_door_code(request, event_id):
 
     code      = 'DOOR-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
     door_code = DoorStaffCode.objects.create(event=event, code=code, created_by=request.user)
+
+    # ── Email organizer the new door code ─────────────────────
+    try:
+        from utils.emails import notify_door_code_generated
+        threading.Thread(
+            target=notify_door_code_generated,
+            args=(event, request.user, code),
+            daemon=True
+        ).start()
+    except Exception as e:
+        print(f"Door code email failed: {e}")
+
     return Response(DoorStaffCodeSerializer(door_code).data, status=status.HTTP_201_CREATED)
 
 
@@ -597,42 +635,36 @@ def buy_resale_ticket(request):
         status='completed',
     )
 
-    # ── Notify buyer ──────────────────────────────────────────
+    # ── Notify seller ticket sold + buyer purchase ────────────
     try:
-        notify_ticket_purchase(new_ticket)
+        from utils.emails import notify_resale_sold, notify_resale_purchased
+        threading.Thread(
+            target=notify_resale_sold,
+            args=(ticket, seller, request.user, seller_amount),
+            daemon=True
+        ).start()
+        threading.Thread(
+            target=notify_resale_purchased,
+            args=(new_ticket, request.user),
+            daemon=True
+        ).start()
     except Exception as e:
-        print(f"Resale purchase email failed: {e}")
-
-    # ── Notify seller their ticket sold ───────────────────────
-    try:
-        from utils.emails import send_notification
-        def _notify_seller():
-            send_notification(
-                user=seller,
-                type='resale_sold',
-                title='Your Ticket Sold! 💰',
-                body=(
-                    f"Hi {seller.first_name},\n\n"
-                    f"Your resale ticket for {ticket.event.name} just sold!\n\n"
-                    f"💰 GHS {float(seller_amount):.2f} added to your wallet (98% payout).\n"
-                    f"Withdraw anytime from your Wallet tab."
-                ),
-            )
-        threading.Thread(target=_notify_seller, daemon=True).start()
-    except Exception as e:
-        print(f"Resale sold notification failed: {e}")
+        print(f"Resale notification failed: {e}")
 
     ticket_data              = TicketSerializer(new_ticket, context={'request': request}).data
     ticket_data['qr_base64'] = qr_base64
 
+    # ── Mint NFT for new owner ────────────────────────────────
     try:
         def on_mint(nft_result):
             try:
+                from utils.emails import notify_nft_minted
                 t = Ticket.objects.get(pk=new_ticket.pk)
                 t.nft_token_id  = nft_result['token_id']
                 t.nft_tx_hash   = nft_result['tx_hash']
                 t.nft_token_uri = nft_result['token_uri']
-                t.save(update_fields=['nft_token_id','nft_tx_hash','nft_token_uri'])
+                t.save(update_fields=['nft_token_id', 'nft_tx_hash', 'nft_token_uri'])
+                threading.Thread(target=notify_nft_minted, args=(t,), daemon=True).start()
             except Exception as e:
                 print(f"Resale NFT save error: {e}")
         mint_ticket_nft_async(new_ticket, callback=on_mint)
@@ -683,7 +715,6 @@ def list_for_resale(request):
     ticket.resale_price = resale_price
     ticket.save(update_fields=['status', 'resale_price'])
 
-    # ── Notify seller listing is live ─────────────────────────
     try:
         from utils.emails import notify_resale_listed
         threading.Thread(

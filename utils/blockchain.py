@@ -1,7 +1,7 @@
-import threading
 import json
 import base64
 import time
+import threading
 from web3 import Web3
 from django.conf import settings
 
@@ -57,9 +57,9 @@ NFT_ABI = [
     {
         "anonymous": False,
         "inputs": [
-            {"indexed": True, "internalType": "address", "name": "from", "type": "address"},
-            {"indexed": True, "internalType": "address", "name": "to", "type": "address"},
-            {"indexed": True, "internalType": "uint256", "name": "tokenId", "type": "uint256"}
+            {"indexed": True,  "internalType": "address", "name": "from",    "type": "address"},
+            {"indexed": True,  "internalType": "address", "name": "to",      "type": "address"},
+            {"indexed": True,  "internalType": "uint256", "name": "tokenId", "type": "uint256"}
         ],
         "name": "Transfer",
         "type": "event"
@@ -91,12 +91,6 @@ def is_blockchain_enabled():
 
 
 def build_ticket_metadata(ticket):
-    """
-    Build NFT metadata — image points to a real Cloudinary asset.
-    DO NOT use data: URIs — OpenSea/Polygonscan won't render them.
-    """
-    # Use the ticket's own QR cloudinary image if available,
-    # otherwise fall back to a static brand image on Cloudinary.
     nft_image = (
         str(ticket.qr_image)
         if ticket.qr_image and str(ticket.qr_image).startswith('http')
@@ -127,27 +121,36 @@ def build_ticket_metadata(ticket):
 
 
 def build_token_uri(ticket):
-    """
-    Build token URI pointing to our own metadata endpoint.
-    This is readable by OpenSea, Polygonscan, and any NFT explorer.
-    Falls back to base64 data URI only if backend URL isn't set.
-    """
     backend_url = getattr(settings, 'BACKEND_URL', '').rstrip('/')
     if backend_url:
         return f"{backend_url}/api/nft/metadata/{ticket.ticket_id}/"
-
-    # Fallback: base64 data URI (works on-chain but not on explorers)
     metadata  = build_ticket_metadata(ticket)
     meta_json = json.dumps(metadata)
     meta_b64  = base64.b64encode(meta_json.encode()).decode()
     return "data:application/json;base64," + meta_b64
 
 
+def _parse_token_id_from_receipt(receipt, contract):
+    """
+    Extract token ID from receipt using ABI event parsing only.
+    Falls back to None if parsing fails — tx_hash is still valid.
+    """
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            events = contract.events.Transfer().process_receipt(receipt)
+        if events:
+            return int(events[0]['args']['tokenId'])
+    except Exception:
+        pass
+    return None
+
+
 def mint_ticket_nft(ticket, owner_wallet_address=None, max_retries=3):
     """
-    Mint NFT on Polygon Mainnet.
-    Retries up to max_retries times on failure.
-    Uses gas estimation instead of hardcoded value.
+    Mint NFT sequentially on Polygon Amoy Testnet.
+    Fixed: always fetches fresh nonce, higher gas price multiplier.
     """
     if not is_blockchain_enabled():
         print("Blockchain not configured — skipping NFT mint")
@@ -160,11 +163,10 @@ def mint_ticket_nft(ticket, owner_wallet_address=None, max_retries=3):
                 print("Could not get contract")
                 return None
 
-            token_uri = build_token_uri(ticket)
-
+            token_uri        = build_token_uri(ticket)
             platform_account = w3.eth.account.from_key(settings.BLOCKCHAIN_PRIVATE_KEY)
-            platform_address  = platform_account.address
-            to_address = (
+            platform_address = platform_account.address
+            to_address       = (
                 Web3.to_checksum_address(owner_wallet_address)
                 if owner_wallet_address
                 else platform_address
@@ -172,17 +174,16 @@ def mint_ticket_nft(ticket, owner_wallet_address=None, max_retries=3):
 
             print(f"[Attempt {attempt}/{max_retries}] Minting NFT to {to_address}...")
 
-            nonce     = w3.eth.get_transaction_count(platform_address)
-            gas_price = int(w3.eth.gas_price * 1.2)
+            nonce     = w3.eth.get_transaction_count(platform_address, 'pending')
+            gas_price = int(w3.eth.gas_price * 1.5)
 
-            # ── Estimate gas instead of hardcoding ──────────────────
             try:
                 estimated_gas = contract.functions.mintTicket(
                     to_address, token_uri
                 ).estimate_gas({'from': platform_address})
-                gas_limit = int(estimated_gas * 1.3)  # 30% buffer
+                gas_limit = int(estimated_gas * 1.3)
             except Exception:
-                gas_limit = 300000  # safe fallback
+                gas_limit = 300000
 
             txn = contract.functions.mintTicket(
                 to_address,
@@ -197,29 +198,26 @@ def mint_ticket_nft(ticket, owner_wallet_address=None, max_retries=3):
 
             signed_txn = w3.eth.account.sign_transaction(txn, settings.BLOCKCHAIN_PRIVATE_KEY)
             tx_hash    = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
-
             print(f"TX sent: {tx_hash.hex()}")
 
             receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
 
             if receipt.status == 1:
-                transfer_events = contract.events.Transfer().process_receipt(receipt)
-                if transfer_events:
-                    token_id    = transfer_events[0]['args']['tokenId']
-                    tx_hash_hex = tx_hash.hex()
-                    print(f"✅ NFT minted! Token ID: {token_id}, TX: {tx_hash_hex}")
-                    return {
-                        'token_id':  token_id,
-                        'tx_hash':   tx_hash_hex,
-                        'token_uri': token_uri,
-                    }
+                token_id    = _parse_token_id_from_receipt(receipt, contract)
+                tx_hash_hex = tx_hash.hex()
+                print(f"✅ NFT minted! Token ID: {token_id}, TX: {tx_hash_hex}")
+                return {
+                    'token_id':  token_id,
+                    'tx_hash':   tx_hash_hex,
+                    'token_uri': token_uri,
+                }
             else:
-                print(f"❌ Transaction failed on attempt {attempt}. Receipt: {receipt}")
+                print(f"❌ Transaction failed on attempt {attempt}.")
 
         except Exception as e:
             print(f"NFT mint error (attempt {attempt}): {e}")
             if attempt < max_retries:
-                time.sleep(2 ** attempt)  # exponential backoff: 2s, 4s
+                time.sleep(3 * attempt)
 
     print(f"NFT mint failed after {max_retries} attempts for ticket {ticket.ticket_id}")
     return None
@@ -228,18 +226,16 @@ def mint_ticket_nft(ticket, owner_wallet_address=None, max_retries=3):
 def mint_ticket_nft_async(ticket, owner_wallet_address=None, callback=None):
     """
     Mint NFT in background thread — doesn't block API response.
-    Marks ticket as mint_failed in DB if all retries fail.
     """
     def _mint():
         result = mint_ticket_nft(ticket, owner_wallet_address)
         if result and callback:
             callback(result)
         elif not result:
-            # ── Mark mint as failed so we can retry later ──────────
             try:
                 from tickets.models import Ticket as TicketModel
                 t = TicketModel.objects.get(pk=ticket.pk)
-                if not t.nft_tx_hash:  # only if never succeeded
+                if not t.nft_tx_hash:
                     t.nft_mint_failed = True
                     t.save(update_fields=['nft_mint_failed'])
                     print(f"⚠️ Marked ticket {t.ticket_id} as mint_failed for retry")
@@ -253,8 +249,8 @@ def mint_ticket_nft_async(ticket, owner_wallet_address=None, callback=None):
 
 def retry_failed_mints():
     """
-    Call this from a management command or cron job to retry failed mints.
-    Run: python manage.py retry_mints
+    Sequential retry — fixes nonce collision from parallel threading.
+    Run from shell: from utils.blockchain import retry_failed_mints; retry_failed_mints()
     """
     try:
         from tickets.models import Ticket as TicketModel
@@ -263,18 +259,39 @@ def retry_failed_mints():
             nft_mint_failed=True,
             status__in=['active', 'resale']
         )
-        print(f"Found {failed.count()} tickets with failed mints")
+        count = failed.count()
+        print(f"Found {count} tickets with failed mints")
+        if count == 0:
+            return
+
         for ticket in failed:
-            def make_callback(t):
-                def cb(result):
-                    t.nft_token_id  = result['token_id']
-                    t.nft_tx_hash   = result['tx_hash']
-                    t.nft_token_uri = result['token_uri']
-                    t.nft_mint_failed = False
-                    t.save(update_fields=['nft_token_id', 'nft_tx_hash', 'nft_token_uri', 'nft_mint_failed'])
-                    print(f"✅ Retry mint succeeded for {t.ticket_id}")
-                return cb
-            mint_ticket_nft_async(ticket, callback=make_callback(ticket))
+            print(f"--- Minting {ticket.ticket_id} ---")
+            result = mint_ticket_nft(ticket)
+            if result:
+                ticket.nft_token_id    = result['token_id']
+                ticket.nft_tx_hash     = result['tx_hash']
+                ticket.nft_token_uri   = result['token_uri']
+                ticket.nft_mint_failed = False
+                ticket.save(update_fields=[
+                    'nft_token_id', 'nft_tx_hash',
+                    'nft_token_uri', 'nft_mint_failed'
+                ])
+                print(f"✅ {ticket.ticket_id} → Token #{result['token_id']}, TX: {result['tx_hash'][:16]}...")
+                try:
+                    from utils.emails import notify_nft_minted
+                    threading.Thread(
+                        target=notify_nft_minted,
+                        args=(ticket,),
+                        daemon=True
+                    ).start()
+                except Exception as e:
+                    print(f"NFT notify error: {e}")
+            else:
+                print(f"❌ {ticket.ticket_id} failed — will retry next time")
+            time.sleep(2)
+
+        print("--- Retry complete ---")
+
     except Exception as e:
         print(f"retry_failed_mints error: {e}")
 
@@ -283,15 +300,15 @@ def transfer_ticket_nft(token_id, from_wallet, to_wallet):
     if not is_blockchain_enabled():
         return None
     try:
-        contract = get_contract()
+        contract         = get_contract()
         if not contract:
             return None
 
         platform_account = w3.eth.account.from_key(settings.BLOCKCHAIN_PRIVATE_KEY)
-        platform_address  = platform_account.address
+        platform_address = platform_account.address
 
-        nonce     = w3.eth.get_transaction_count(platform_address)
-        gas_price = int(w3.eth.gas_price * 1.2)
+        nonce     = w3.eth.get_transaction_count(platform_address, 'pending')
+        gas_price = int(w3.eth.gas_price * 1.5)
 
         try:
             estimated_gas = contract.functions.transferFrom(
