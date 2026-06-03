@@ -13,7 +13,9 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-master-events-dev-key-change-in-production')
+SECRET_KEY = os.getenv('SECRET_KEY')
+if not SECRET_KEY:
+    raise ValueError("SECRET_KEY environment variable is not set")
 
 # ── Environment ───────────────────────────────────────────────
 DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
@@ -55,6 +57,7 @@ INSTALLED_APPS = [
     # Third party
     'rest_framework',
     'rest_framework_simplejwt',
+    'rest_framework_simplejwt.token_blacklist', 
     'corsheaders',
     'cloudinary_storage',
     'cloudinary',
@@ -159,13 +162,14 @@ REST_FRAMEWORK = {
 
 # ── JWT — tokens ──────────────────────────────────────────────
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME':  timedelta(days=1),
+    'ACCESS_TOKEN_LIFETIME':  timedelta(hours=2), 
     'REFRESH_TOKEN_LIFETIME': timedelta(days=30),
     'ROTATE_REFRESH_TOKENS':  True,
     'BLACKLIST_AFTER_ROTATION': True,
     'ALGORITHM': 'HS256',
     'AUTH_HEADER_TYPES': ('Bearer',),
 }
+
 
 # ── Password reset — 30 minute expiry ────────────────────────
 PASSWORD_RESET_TIMEOUT = 1800  # 30 minutes in seconds
