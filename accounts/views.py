@@ -41,17 +41,24 @@ def register(request):
         user   = serializer.save()
         tokens = get_tokens(user)
 
-        def _welcome():
+        # Send welcome email + verification email in background
+        def _post_register():
             try:
                 from utils.emails import notify_welcome
                 notify_welcome(user)
             except Exception as e:
                 print(f"Welcome email failed: {e}")
-        threading.Thread(target=_welcome, daemon=True).start()
+            try:
+                _send_verification_email(user)
+            except Exception as e:
+                print(f"Verification email failed: {e}")
+
+        threading.Thread(target=_post_register, daemon=True).start()
 
         return Response({
-            'user':   UserSerializer(user).data,
-            'tokens': tokens,
+            'user':    UserSerializer(user).data,
+            'tokens':  tokens,
+            'message': 'Account created! Please check your email to verify your account.',
         }, status=status.HTTP_201_CREATED)
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -455,3 +462,127 @@ def admin_toggle_event(request, event_id):
     event.is_active = not event.is_active
     event.save(update_fields=['is_active'])
     return Response({'message': f'Event {"activated" if event.is_active else "deactivated"}', 'is_active': event.is_active})
+
+
+
+
+    # ── Email verification helpers ────────────────────────────────
+def _send_verification_email(user):
+    from .models import EmailVerificationToken
+    # Delete any existing token
+    EmailVerificationToken.objects.filter(user=user).delete()
+    # Create new token
+    vt        = EmailVerificationToken.objects.create(user=user)
+    token_str = str(vt.token)
+    verify_url = f"{settings.FRONTEND_URL}?verify={token_str}"
+
+    import resend
+    resend.api_key = settings.RESEND_API_KEY
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="UTF-8"></head>
+    <body style="margin:0;padding:0;background:#0f0f0f;font-family:'Helvetica Neue',Arial,sans-serif;">
+        <div style="max-width:600px;margin:0 auto;padding:24px 16px;">
+            <div style="background:linear-gradient(135deg,#F97316,#EA6C0A);border-radius:20px 20px 0 0;padding:32px;text-align:center;">
+                <div style="font-size:32px;margin-bottom:8px;">✉️</div>
+                <h1 style="margin:0;color:#fff;font-size:22px;font-weight:900;">Verify Your Email</h1>
+                <p style="margin:6px 0 0;color:rgba(255,255,255,0.8);font-size:13px;">Master Events Ghana</p>
+            </div>
+            <div style="background:#1a1a1a;padding:32px;border-left:1px solid #2a2a2a;border-right:1px solid #2a2a2a;">
+                <p style="color:rgba(255,255,255,0.75);font-size:15px;line-height:1.8;margin:0 0 24px;">
+                    Hi {user.first_name},<br><br>
+                    Thanks for joining Master Events! Click below to verify your email address.
+                    This link expires in <strong style="color:#F97316;">24 hours</strong>.
+                </p>
+                <div style="text-align:center;margin:28px 0;">
+                    <a href="{verify_url}"
+                       style="background:linear-gradient(135deg,#F97316,#EA6C0A);color:#fff;padding:16px 40px;border-radius:12px;text-decoration:none;font-weight:700;font-size:16px;display:inline-block;">
+                        Verify Email →
+                    </a>
+                </div>
+                <p style="color:rgba(255,255,255,0.35);font-size:12px;text-align:center;">
+                    If you didn't create an account, ignore this email.
+                </p>
+            </div>
+            <div style="background:#111;border-radius:0 0 20px 20px;border:1px solid #2a2a2a;border-top:none;padding:16px;text-align:center;">
+                <p style="color:rgba(255,255,255,0.2);font-size:10px;margin:0;">© 2026 Master Events Ghana</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    resend.Emails.send({
+        "from":    settings.DEFAULT_FROM_EMAIL,
+        "to":      [user.email],
+        "subject": "Master Events — Verify Your Email",
+        "html":    html,
+        "text":    f"Hi {user.first_name},\n\nVerify your email:\n{verify_url}\n\nExpires in 24 hours.",
+    })
+    print(f"✅ Verification email sent to {user.email}")
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def verify_email(request):
+    """Verify email with token from URL"""
+    token_str = request.data.get('token', '').strip()
+    if not token_str:
+        return Response({'error': 'Token is required'}, status=400)
+
+    from .models import EmailVerificationToken
+    from django.utils import timezone
+    from datetime import timedelta
+
+    try:
+        import uuid
+        token_uuid = uuid.UUID(token_str)
+        vt = EmailVerificationToken.objects.select_related('user').get(token=token_uuid)
+    except (ValueError, EmailVerificationToken.DoesNotExist):
+        return Response({'error': 'Invalid verification token'}, status=400)
+
+    # Check expiry — 24 hours
+    if timezone.now() > vt.created_at + timedelta(hours=24):
+        vt.delete()
+        return Response({'error': 'Verification link expired. Please request a new one.'}, status=400)
+
+    # Mark verified
+    user = vt.user
+    user.is_verified = True
+    user.save(update_fields=['is_verified'])
+    vt.delete()
+
+    return Response({
+        'message': 'Email verified successfully! You can now use all features.',
+        'email':   user.email,
+    })
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+@ratelimit(key='ip', rate='3/m', method='POST', block=False)
+def resend_verification(request):
+    """Resend verification email"""
+    if getattr(request, 'limited', False):
+        return rate_limited_response()
+
+    email = request.data.get('email', '').strip().lower()
+    if not email:
+        return Response({'error': 'Email is required'}, status=400)
+
+    try:
+        user = User.objects.get(email=email)
+    except User.DoesNotExist:
+        # Don't reveal if email exists
+        return Response({'message': 'If an account exists, a verification email has been sent.'})
+
+    if user.is_verified:
+        return Response({'message': 'This email is already verified.'})
+
+    threading.Thread(
+        target=_send_verification_email,
+        args=(user,),
+        daemon=True
+    ).start()
+
+    return Response({'message': 'Verification email sent. Check your inbox.'})
