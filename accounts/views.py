@@ -9,6 +9,7 @@ from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.conf import settings
 from django_ratelimit.decorators import ratelimit
+from django_q.tasks import async_task
 from .serializers import RegisterSerializer, LoginSerializer, UserSerializer
 from .models import Notification, User
 import threading
@@ -41,19 +42,11 @@ def register(request):
         user   = serializer.save()
         tokens = get_tokens(user)
 
-        # Send welcome email + verification email in background
-        def _post_register():
-            try:
-                from utils.emails import notify_welcome
-                notify_welcome(user)
-            except Exception as e:
-                print(f"Welcome email failed: {e}")
-            try:
-                _send_verification_email(user)
-            except Exception as e:
-                print(f"Verification email failed: {e}")
-
-        threading.Thread(target=_post_register, daemon=True).start()
+        # ── Queue welcome + verification emails ───────────────
+        try:
+            async_task('accounts.tasks.task_send_welcome_and_verification', user.pk)
+        except Exception as e:
+            print(f"Welcome email queue failed: {e}")
 
         return Response({
             'user':    UserSerializer(user).data,
@@ -119,15 +112,13 @@ def forgot_password(request):
 
     token     = default_token_generator.make_token(user)
     uid       = urlsafe_base64_encode(force_bytes(user.pk))
-    reset_url = f"https://master-events-bi7m.vercel.app/reset-password?uid={uid}&token={token}"
+    reset_url = f"{getattr(settings, 'FRONTEND_URL', 'https://master-events-bi7m.vercel.app')}?uid={uid}&token={token}"
 
-    def _send():
-        try:
-            from utils.emails import notify_password_reset
-            notify_password_reset(user, reset_url)
-        except Exception as e:
-            print(f"Password reset email error: {e}")
-    threading.Thread(target=_send, daemon=True).start()
+    # ── Queue password reset email ────────────────────────────
+    try:
+        async_task('accounts.tasks.task_send_password_reset_email', user.pk, reset_url)
+    except Exception as e:
+        print(f"Password reset email queue failed: {e}")
 
     return Response({'message': 'Password reset link sent to your email.'})
 
@@ -230,7 +221,6 @@ def revoke_all_sessions(request):
 @api_view(['DELETE'])
 @permission_classes([IsAuthenticated])
 def delete_account(request):
-    """Requires password confirmation before deleting"""
     password = request.data.get('password', '')
     if not password:
         return Response({'error': 'Password is required to delete account'}, status=400)
@@ -259,6 +249,7 @@ def test_email(request):
         'DEFAULT_FROM':       getattr(settings, 'DEFAULT_FROM_EMAIL', 'NOT SET'),
     }
 
+    # ── Keep threading for test endpoint — debug only ─────────
     def _send():
         try:
             resend.api_key = settings.RESEND_API_KEY
@@ -278,7 +269,7 @@ def test_email(request):
     return Response(config)
 
 
-# ── Admin login — FIXED (was indented inside test_email) ──────
+# ── Admin login ───────────────────────────────────────────────
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def admin_login(request):
@@ -306,7 +297,7 @@ def admin_login(request):
     )
 
 
-# ── Super Admin: platform overview ───────────────────────────
+# ── Super Admin helpers ───────────────────────────────────────
 def is_super_admin(user):
     return user.is_authenticated and user.role == 'super_admin'
 
@@ -327,28 +318,13 @@ def admin_overview(request):
     total_events     = Event.objects.count()
     active_events    = Event.objects.filter(sales_open=True, is_active=True).count()
     total_tickets    = Ticket.objects.count()
-    total_revenue    = sum(
-        float(w.total_earned)
-        for w in Wallet.objects.all()
-    )
-    total_withdrawn  = sum(
-        float(w.total_withdrawn)
-        for w in Wallet.objects.all()
-    )
+    total_revenue    = sum(float(w.total_earned) for w in Wallet.objects.all())
+    total_withdrawn  = sum(float(w.total_withdrawn) for w in Wallet.objects.all())
 
     return Response({
-        'users': {
-            'total':      total_users,
-            'attendees':  total_attendees,
-            'organizers': total_organizers,
-        },
-        'events': {
-            'total':  total_events,
-            'active': active_events,
-        },
-        'tickets': {
-            'total': total_tickets,
-        },
+        'users':   {'total': total_users, 'attendees': total_attendees, 'organizers': total_organizers},
+        'events':  {'total': total_events, 'active': active_events},
+        'tickets': {'total': total_tickets},
         'revenue': {
             'total_earned':    round(total_revenue, 2),
             'total_withdrawn': round(total_withdrawn, 2),
@@ -369,8 +345,8 @@ def admin_organizers(request):
     organizers = User.objects.filter(role='organizer').order_by('-date_joined')
     data = []
     for org in organizers:
-        events  = Event.objects.filter(organizer=org)
-        wallet  = Wallet.objects.filter(user=org).first()
+        events = Event.objects.filter(organizer=org)
+        wallet = Wallet.objects.filter(user=org).first()
         data.append({
             'id':           org.id,
             'name':         org.full_name,
@@ -396,19 +372,19 @@ def admin_events(request):
     from events.models import Event
     events = Event.objects.select_related('organizer').order_by('-created_at')[:100]
     data = [{
-        'id':            e.id,
-        'name':          e.name,
-        'organizer':     e.organizer.full_name,
-        'organizer_email': e.organizer.email,
-        'date':          str(e.date),
-        'venue':         e.venue,
-        'category':      e.category,
-        'price':         float(e.price),
-        'total_tickets': e.total_tickets,
-        'tickets_sold':  e.tickets_sold,
-        'sales_open':    e.sales_open,
-        'is_active':     e.is_active,
-        'revenue':       round(float(e.price) * e.tickets_sold * 0.95, 2),
+        'id':               e.id,
+        'name':             e.name,
+        'organizer':        e.organizer.full_name,
+        'organizer_email':  e.organizer.email,
+        'date':             str(e.date),
+        'venue':            e.venue,
+        'category':         e.category,
+        'price':            float(e.price),
+        'total_tickets':    e.total_tickets,
+        'tickets_sold':     e.tickets_sold,
+        'sales_open':       e.sales_open,
+        'is_active':        e.is_active,
+        'revenue':          round(float(e.price) * e.tickets_sold * 0.95, 2),
     } for e in events]
     return Response(data)
 
@@ -461,20 +437,19 @@ def admin_toggle_event(request, event_id):
         return Response({'error': 'Event not found'}, status=404)
     event.is_active = not event.is_active
     event.save(update_fields=['is_active'])
-    return Response({'message': f'Event {"activated" if event.is_active else "deactivated"}', 'is_active': event.is_active})
+    return Response({
+        'message':   f'Event {"activated" if event.is_active else "deactivated"}',
+        'is_active': event.is_active,
+    })
 
 
-
-
-    # ── Email verification helpers ────────────────────────────────
+# ── Email verification ────────────────────────────────────────
 def _send_verification_email(user):
     from .models import EmailVerificationToken
-    # Delete any existing token
     EmailVerificationToken.objects.filter(user=user).delete()
-    # Create new token
-    vt        = EmailVerificationToken.objects.create(user=user)
-    token_str = str(vt.token)
-    verify_url = f"{settings.FRONTEND_URL}?verify={token_str}"
+    vt         = EmailVerificationToken.objects.create(user=user)
+    token_str  = str(vt.token)
+    verify_url = f"{getattr(settings, 'FRONTEND_URL', 'https://master-events-bi7m.vercel.app')}?verify={token_str}"
 
     import resend
     resend.api_key = settings.RESEND_API_KEY
@@ -525,7 +500,6 @@ def _send_verification_email(user):
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def verify_email(request):
-    """Verify email with token from URL"""
     token_str = request.data.get('token', '').strip()
     if not token_str:
         return Response({'error': 'Token is required'}, status=400)
@@ -533,20 +507,18 @@ def verify_email(request):
     from .models import EmailVerificationToken
     from django.utils import timezone
     from datetime import timedelta
+    import uuid
 
     try:
-        import uuid
         token_uuid = uuid.UUID(token_str)
         vt = EmailVerificationToken.objects.select_related('user').get(token=token_uuid)
     except (ValueError, EmailVerificationToken.DoesNotExist):
         return Response({'error': 'Invalid verification token'}, status=400)
 
-    # Check expiry — 24 hours
     if timezone.now() > vt.created_at + timedelta(hours=24):
         vt.delete()
         return Response({'error': 'Verification link expired. Please request a new one.'}, status=400)
 
-    # Mark verified
     user = vt.user
     user.is_verified = True
     user.save(update_fields=['is_verified'])
@@ -562,7 +534,6 @@ def verify_email(request):
 @permission_classes([AllowAny])
 @ratelimit(key='ip', rate='3/m', method='POST', block=False)
 def resend_verification(request):
-    """Resend verification email"""
     if getattr(request, 'limited', False):
         return rate_limited_response()
 
@@ -573,16 +544,15 @@ def resend_verification(request):
     try:
         user = User.objects.get(email=email)
     except User.DoesNotExist:
-        # Don't reveal if email exists
         return Response({'message': 'If an account exists, a verification email has been sent.'})
 
     if user.is_verified:
         return Response({'message': 'This email is already verified.'})
 
-    threading.Thread(
-        target=_send_verification_email,
-        args=(user,),
-        daemon=True
-    ).start()
+    # ── Queue resend verification ─────────────────────────────
+    try:
+        async_task('accounts.tasks.task_send_resend_verification', user.pk)
+    except Exception as e:
+        print(f"Resend verification queue failed: {e}")
 
     return Response({'message': 'Verification email sent. Check your inbox.'})

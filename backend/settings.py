@@ -57,10 +57,11 @@ INSTALLED_APPS = [
     # Third party
     'rest_framework',
     'rest_framework_simplejwt',
-    'rest_framework_simplejwt.token_blacklist', 
+    'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
     'cloudinary_storage',
     'cloudinary',
+    'django_q',                # ← Django-Q2 task queue
     # Our apps
     'accounts',
     'events',
@@ -160,48 +161,41 @@ REST_FRAMEWORK = {
     'EXCEPTION_HANDLER': 'accounts.exceptions.custom_exception_handler',
 }
 
-# ── JWT — tokens ──────────────────────────────────────────────
+# ── JWT ───────────────────────────────────────────────────────
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME':  timedelta(hours=2), 
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=30),
-    'ROTATE_REFRESH_TOKENS':  True,
+    'ACCESS_TOKEN_LIFETIME':    timedelta(hours=2),
+    'REFRESH_TOKEN_LIFETIME':   timedelta(days=30),
+    'ROTATE_REFRESH_TOKENS':    True,
     'BLACKLIST_AFTER_ROTATION': True,
-    'ALGORITHM': 'HS256',
-    'AUTH_HEADER_TYPES': ('Bearer',),
+    'ALGORITHM':                'HS256',
+    'AUTH_HEADER_TYPES':        ('Bearer',),
 }
 
-
 # ── Password reset — 30 minute expiry ────────────────────────
-PASSWORD_RESET_TIMEOUT = 1800  # 30 minutes in seconds
+PASSWORD_RESET_TIMEOUT = 1800
 
 # ── Security headers ──────────────────────────────────────────
-# These kick in when DEBUG=False (production on Render)
-SECURE_BROWSER_XSS_FILTER        = True
-SECURE_CONTENT_TYPE_NOSNIFF       = True
-SECURE_REFERRER_POLICY            = 'strict-origin-when-cross-origin'
-X_FRAME_OPTIONS                   = 'DENY'
+SECURE_BROWSER_XSS_FILTER     = True
+SECURE_CONTENT_TYPE_NOSNIFF   = True
+SECURE_REFERRER_POLICY        = 'strict-origin-when-cross-origin'
+X_FRAME_OPTIONS               = 'DENY'
+SECURE_SSL_REDIRECT           = not DEBUG
+SECURE_HSTS_SECONDS           = 63072000
+SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+SECURE_HSTS_PRELOAD           = True
+SECURE_PROXY_SSL_HEADER       = ('HTTP_X_FORWARDED_PROTO', 'https')
+SESSION_COOKIE_SECURE         = not DEBUG
+SESSION_COOKIE_HTTPONLY       = True
+SESSION_COOKIE_SAMESITE       = 'Lax'
+CSRF_COOKIE_SECURE            = not DEBUG
+CSRF_COOKIE_HTTPONLY          = True
+CSRF_COOKIE_SAMESITE          = 'Lax'
 
-# HTTPS enforcement — enable on Render (always HTTPS)
-SECURE_SSL_REDIRECT               = not DEBUG
-SECURE_HSTS_SECONDS               = 63072000   # 2 years
-SECURE_HSTS_INCLUDE_SUBDOMAINS    = True
-SECURE_HSTS_PRELOAD               = True
-SECURE_PROXY_SSL_HEADER           = ('HTTP_X_FORWARDED_PROTO', 'https')
-
-# Session security
-SESSION_COOKIE_SECURE             = not DEBUG
-SESSION_COOKIE_HTTPONLY           = True
-SESSION_COOKIE_SAMESITE           = 'Lax'
-CSRF_COOKIE_SECURE                = not DEBUG
-CSRF_COOKIE_HTTPONLY              = True
-CSRF_COOKIE_SAMESITE              = 'Lax'
-
-# ── Logging — structured, with critical alerts ────────────────
+# ── Logging ───────────────────────────────────────────────────
 os.makedirs(os.path.join(BASE_DIR, 'logs'), exist_ok=True)
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
-
     'formatters': {
         'verbose': {
             'format': '[{levelname}] {asctime} {module} {process:d} {thread:d} — {message}',
@@ -212,24 +206,16 @@ LOGGING = {
             'style': '{',
         },
     },
-
     'filters': {
-        'require_debug_false': {
-            '()': 'django.utils.log.RequireDebugFalse',
-        },
-        'require_debug_true': {
-            '()': 'django.utils.log.RequireDebugTrue',
-        },
+        'require_debug_false': {'()': 'django.utils.log.RequireDebugFalse'},
+        'require_debug_true':  {'()': 'django.utils.log.RequireDebugTrue'},
     },
-
     'handlers': {
-        # Console — always on
         'console': {
             'level': 'INFO',
             'class': 'logging.StreamHandler',
             'formatter': 'simple',
         },
-        # File — errors only, rotates at 5MB, keeps 3 backups
         'file_error': {
             'level': 'ERROR',
             'class': 'logging.handlers.RotatingFileHandler',
@@ -238,7 +224,6 @@ LOGGING = {
             'backupCount': 3,
             'formatter': 'verbose',
         },
-        # File — all requests
         'file_info': {
             'level': 'INFO',
             'class': 'logging.handlers.RotatingFileHandler',
@@ -247,7 +232,6 @@ LOGGING = {
             'backupCount': 5,
             'formatter': 'simple',
         },
-        # Email admins on CRITICAL failures — only in production
         'mail_admins': {
             'level': 'CRITICAL',
             'class': 'django.utils.log.AdminEmailHandler',
@@ -255,27 +239,22 @@ LOGGING = {
             'formatter': 'verbose',
         },
     },
-
     'loggers': {
-        # Django core
         'django': {
             'handlers': ['console', 'file_error'],
             'level': 'INFO',
             'propagate': True,
         },
-        # Django requests — logs 500s
         'django.request': {
             'handlers': ['console', 'file_error', 'mail_admins'],
             'level': 'ERROR',
             'propagate': False,
         },
-        # Django security — logs suspicious activity
         'django.security': {
             'handlers': ['console', 'file_error', 'mail_admins'],
             'level': 'WARNING',
             'propagate': False,
         },
-        # Our apps
         'accounts': {
             'handlers': ['console', 'file_info', 'file_error'],
             'level': 'INFO',
@@ -303,23 +282,22 @@ LOGGING = {
 PAYSTACK_SECRET_KEY = os.getenv('PAYSTACK_SECRET_KEY', '')
 PAYSTACK_PUBLIC_KEY = os.getenv('PAYSTACK_PUBLIC_KEY', '')
 BACKEND_URL         = os.getenv('BACKEND_URL', 'https://master-events-backend.onrender.com')
-
+FRONTEND_URL        = os.getenv('FRONTEND_URL', 'https://master-events-bi7m.vercel.app')
 
 # ── Email via Resend ──────────────────────────────────────────
-RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
+RESEND_API_KEY     = os.environ.get('RESEND_API_KEY', '')
 DEFAULT_FROM_EMAIL = "Master Events <onboarding@resend.dev>"
 
-
-# Admin email for CRITICAL log alerts
-ADMINS = [('Master Events Admin', os.getenv('ADMIN_EMAIL', 'mastereventgh@gmail.com'))]
+# ── Admin alerts ──────────────────────────────────────────────
+ADMINS       = [('Master Events Admin', os.getenv('ADMIN_EMAIL', 'mastereventgh@gmail.com'))]
 SERVER_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', 'mastereventgh@gmail.com')
 
-# Blockchain
-NFT_CONTRACT_ADDRESS  = os.getenv('NFT_CONTRACT_ADDRESS', '')
+# ── Blockchain ────────────────────────────────────────────────
+NFT_CONTRACT_ADDRESS   = os.getenv('NFT_CONTRACT_ADDRESS', '')
 BLOCKCHAIN_PRIVATE_KEY = os.getenv('BLOCKCHAIN_PRIVATE_KEY', '')
-THIRDWEB_SECRET_KEY   = os.getenv('THIRDWEB_SECRET_KEY', '')
+THIRDWEB_SECRET_KEY    = os.getenv('THIRDWEB_SECRET_KEY', '')
 
-# Cloudinary
+# ── Cloudinary ────────────────────────────────────────────────
 CLOUDINARY_STORAGE = {
     'CLOUD_NAME': os.getenv('CLOUDINARY_CLOUD_NAME'),
     'API_KEY':    os.getenv('CLOUDINARY_API_KEY'),
@@ -333,3 +311,18 @@ cloudinary.config(
     api_secret = os.getenv('CLOUDINARY_API_SECRET'),
     secure     = True,
 )
+
+# ── Django-Q2 Task Queue ──────────────────────────────────────
+Q_CLUSTER = {
+    'name':        'master_events',
+    'workers':     2,
+    'timeout':     120,
+    'retry':       180,
+    'queue_limit': 50,
+    'bulk':        10,
+    'orm':         'default',
+    'ack_failures': True,
+    'max_attempts': 3,
+    'label':       'Master Events Queue',
+    'catch_up':    False,
+}

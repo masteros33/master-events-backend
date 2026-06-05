@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: master-events-backend
+    env: python
+    buildCommand: pip install -r requirements.txt && python manage.py migrate
+    startCommand: gunicorn backend.wsgi:application
+
+  - type: worker
+    name: master-events-worker
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python manage.py qcluster
