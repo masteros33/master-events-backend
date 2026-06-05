@@ -81,6 +81,24 @@ def me(request):
     return Response(UserSerializer(request.user).data)
 
 
+@api_view(['PATCH'])
+@permission_classes([IsAuthenticated])
+def update_profile(request):
+    from .serializers import UpdateProfileSerializer
+    serializer = UpdateProfileSerializer(
+        request.user,
+        data=request.data,
+        partial=True,
+    )
+    if serializer.is_valid():
+        serializer.save()
+        return Response({
+            'message': 'Profile updated successfully',
+            'user':    UserSerializer(request.user).data,
+        })
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def logout(request):

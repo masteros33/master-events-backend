@@ -2,18 +2,20 @@ from rest_framework import serializers
 from django.contrib.auth import authenticate
 from .models import User
 
+
 class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, min_length=6)
 
     class Meta:
-        model = User
+        model  = User
         fields = ['id', 'first_name', 'last_name', 'email', 'phone', 'role', 'password']
 
     def create(self, validated_data):
         return User.objects.create_user(**validated_data)
 
+
 class LoginSerializer(serializers.Serializer):
-    email = serializers.EmailField()
+    email    = serializers.EmailField()
     password = serializers.CharField()
 
     def validate(self, data):
@@ -25,7 +27,25 @@ class LoginSerializer(serializers.Serializer):
         data['user'] = user
         return data
 
+
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
-        model = User
+        model  = User
         fields = ['id', 'first_name', 'last_name', 'email', 'phone', 'role', 'is_verified']
+
+
+class UpdateProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model  = User
+        fields = ['first_name', 'last_name', 'phone']
+
+    def validate_first_name(self, value):
+        if not value.strip():
+            raise serializers.ValidationError('First name cannot be empty')
+        return value.strip()
+
+    def validate_last_name(self, value):
+        return value.strip()
+
+    def validate_phone(self, value):
+        return value.strip()
