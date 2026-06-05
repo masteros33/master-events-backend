@@ -99,6 +99,66 @@ def update_profile(request):
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@ratelimit(key='user', rate='5/m', method='POST', block=False)
+def change_password(request):
+    if getattr(request, 'limited', False):
+        return rate_limited_response()
+
+    current_password = request.data.get('current_password', '')
+    new_password     = request.data.get('new_password', '')
+
+    if not current_password or not new_password:
+        return Response(
+            {'error': 'Both current and new password are required'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    if len(new_password) < 8:
+        return Response(
+            {'error': 'New password must be at least 8 characters'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    if not request.user.check_password(current_password):
+        return Response(
+            {'error': 'Current password is incorrect'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    if current_password == new_password:
+        return Response(
+            {'error': 'New password must be different from current password'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    request.user.set_password(new_password)
+    request.user.save()
+    print(f"✅ Password changed for {request.user.email}")
+    return Response({'message': 'Password changed successfully'})
+
+
+@api_view(['PATCH'])
+@permission_classes([IsAuthenticated])
+def update_wallet(request):
+    """Save MetaMask wallet address"""
+    wallet_address = request.data.get('wallet_address', '').strip()
+    if not wallet_address:
+        return Response({'error': 'Wallet address required'}, status=400)
+    if not wallet_address.startswith('0x') or len(wallet_address) != 42:
+        return Response({'error': 'Invalid Ethereum wallet address'}, status=400)
+    request.user.wallet_address = wallet_address
+    request.user.save(update_fields=['wallet_address'])
+    print(f"✅ Wallet linked for {request.user.email}: {wallet_address}")
+    return Response({
+        'message':        'Wallet connected successfully',
+        'wallet_address': wallet_address,
+    })
+
+
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def logout(request):
