@@ -26,10 +26,11 @@ def upload_to_cloudinary(source):
         print(f"⚠️ Cloudinary upload failed: {e}")
         return None
 
-
-@api_view(['GET'])
+@api_view(['GET', 'HEAD'])
 @permission_classes([AllowAny])
 def event_list(request):
+    if request.method == 'HEAD':
+        return Response(status=200)
     city     = request.query_params.get('city')
     category = request.query_params.get('category')
     search   = request.query_params.get('search')
