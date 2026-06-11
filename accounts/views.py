@@ -91,11 +91,11 @@ def login(request):
     fails = cache.get(fail_key, 0) + 1
     cache.set(fail_key, fails, timeout=600)  # 10 min window
 
-    if fails >= 10:
+    if fails >= 5:
         from django.utils import timezone as tz
         from datetime import timedelta
-        lockout_until = tz.now() + timedelta(minutes=15)
-        cache.set(lockout_key, lockout_until, timeout=900)
+        lockout_until = tz.now() + timedelta(minutes=5)
+        cache.set(lockout_key, lockout_until, timeout=300)
         cache.delete(fail_key)
         print(f"🔒 Account locked: {email} after {fails} failed attempts")
         return Response({
