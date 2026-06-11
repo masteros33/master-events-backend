@@ -7,6 +7,7 @@ from .models import Wallet, Transaction
 from .serializers import WalletSerializer, TransactionSerializer
 from utils.emails import notify_withdrawal
 from decimal import Decimal
+from django.db import transaction as db_transaction
 import uuid
 import requests
 import hmac
@@ -168,19 +169,26 @@ def withdraw(request):
 
     if amount < 10:
         return Response({'error': 'Minimum withdrawal is GHS 10'}, status=400)
-
     if not account:
         return Response({'error': 'Account number is required'}, status=400)
 
-    wallet, _ = Wallet.objects.get_or_create(user=request.user)
+    # ── Atomic balance check + deduction ─────────────────────
+    try:
+        with db_transaction.atomic():
+            wallet = Wallet.objects.select_for_update().get_or_create(
+                user=request.user
+            )[0]
+            if wallet.balance < amount:
+                return Response({'error': 'Insufficient balance'}, status=400)
+            wallet.balance         -= amount
+            wallet.total_withdrawn += amount
+            wallet.save()
+    except Exception as e:
+        return Response({'error': 'Withdrawal failed. Try again.'}, status=500)
 
-    if wallet.balance < amount:
-        return Response({'error': 'Insufficient balance'}, status=400)
-
-    reference  = f"WD-{str(uuid.uuid4())[:8].upper()}"
-    owner_name = request.user.get_full_name() or request.user.email
-    secret_key = getattr(settings, 'PAYSTACK_SECRET_KEY', '')
-
+    reference    = f"WD-{str(uuid.uuid4())[:8].upper()}"
+    owner_name   = request.user.get_full_name() or request.user.email
+    secret_key   = getattr(settings, 'PAYSTACK_SECRET_KEY', '')
     transfer_code   = None
     transfer_status = "completed"
 
@@ -194,22 +202,16 @@ def withdraw(request):
                 reason=f"Master Events withdrawal — {owner_name}",
             )
             if not success:
-                return Response(
-                    {'error': f'Payout failed: {tx_status}. Please try again.'},
-                    status=400
-                )
+                # ── Refund balance if transfer fails ──────────
+                with db_transaction.atomic():
+                    wallet.refresh_from_db()
+                    wallet.balance         += amount
+                    wallet.total_withdrawn -= amount
+                    wallet.save()
+                return Response({'error': f'Payout failed: {tx_status}'}, status=400)
             transfer_status = "completed" if tx_status == "success" else "pending"
-            print(f"✅ Paystack transfer: {transfer_code}, status: {tx_status}")
         else:
-            print(f"⚠️ Could not create recipient for {account} — manual payout needed")
             transfer_status = "pending"
-    else:
-        print("⚠️ No PAYSTACK_SECRET_KEY — simulating withdrawal")
-        transfer_status = "completed"
-
-    wallet.balance         -= amount
-    wallet.total_withdrawn += amount
-    wallet.save()
 
     Transaction.objects.create(
         wallet=wallet,
@@ -231,11 +233,8 @@ def withdraw(request):
         'reference':     reference,
         'transfer_code': transfer_code,
         'status':        transfer_status,
-        'method':        method,
-        'account':       account,
         'new_balance':   float(wallet.balance),
     })
-
 
 # ── Paystack webhook ──────────────────────────────────────────
 @api_view(['POST'])

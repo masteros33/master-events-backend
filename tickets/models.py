@@ -56,6 +56,7 @@ class DoorStaffCode(models.Model):
     created_by = models.ForeignKey(User, on_delete=models.CASCADE)
     is_active  = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    used_at    = models.DateTimeField(null=True, blank=True) 
 
     class Meta:
         db_table = 'door_staff_codes'

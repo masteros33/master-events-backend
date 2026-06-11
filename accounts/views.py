@@ -12,6 +12,7 @@ from django_ratelimit.decorators import ratelimit
 from django_q.tasks import async_task
 from .serializers import RegisterSerializer, LoginSerializer, UserSerializer
 from .models import Notification, User
+from django.core.cache import cache
 import threading
 
 
@@ -64,16 +65,44 @@ def login(request):
     if getattr(request, 'limited', False):
         return rate_limited_response()
 
+    email = request.data.get('email', '').strip().lower()
+
+    # ── Check lockout ─────────────────────────────────────────
+    lockout_key    = f"login_lockout_{email}"
+    fail_key       = f"login_fails_{email}"
+    locked_until   = cache.get(lockout_key)
+
+    if locked_until:
+        remaining = int((locked_until - timezone.now()).total_seconds() / 60) + 1
+        return Response({
+            'error': f'Account temporarily locked. Try again in {remaining} minute(s).'
+        }, status=429)
+
     serializer = LoginSerializer(data=request.data)
     if serializer.is_valid():
+        # ── Success — clear fail count ────────────────────────
+        cache.delete(fail_key)
+        cache.delete(lockout_key)
         user   = serializer.validated_data['user']
         tokens = get_tokens(user)
-        return Response({
-            'user':   UserSerializer(user).data,
-            'tokens': tokens,
-        })
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'user': UserSerializer(user).data, 'tokens': tokens})
 
+    # ── Failed login — increment counter ─────────────────────
+    fails = cache.get(fail_key, 0) + 1
+    cache.set(fail_key, fails, timeout=600)  # 10 min window
+
+    if fails >= 10:
+        from django.utils import timezone as tz
+        from datetime import timedelta
+        lockout_until = tz.now() + timedelta(minutes=15)
+        cache.set(lockout_key, lockout_until, timeout=900)
+        cache.delete(fail_key)
+        print(f"🔒 Account locked: {email} after {fails} failed attempts")
+        return Response({
+            'error': 'Too many failed attempts. Account locked for 15 minutes.'
+        }, status=429)
+
+    return Response(serializer.errors, status=400)
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])

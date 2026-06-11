@@ -22,6 +22,10 @@ import qrcode
 from io import BytesIO
 import base64
 import cloudinary.uploader
+from django.utils import timezone
+from datetime import timedelta
+from django.db import transaction
+
 
 
 # ── Paystack verification ─────────────────────────────────────
@@ -104,82 +108,81 @@ def my_tickets(request):
 @ratelimit(key='user', rate='10/m', method='POST', block=False)
 def purchase_ticket(request):
     if getattr(request, 'limited', False):
-        return Response(
-            {'error': 'Too many purchase attempts. Please wait before trying again.'},
-            status=429
-        )
+        return Response({'error': 'Too many purchase attempts.'}, status=429)
 
     serializer = PurchaseSerializer(data=request.data)
     if not serializer.is_valid():
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        return Response(serializer.errors, status=400)
 
     data = serializer.validated_data
 
+    total         = None
+    total_pesewas = None
+
+    # ── Verify payment first (outside lock) ───────────────────
     try:
         event = Event.objects.get(pk=data['event_id'], is_active=True, sales_open=True)
     except Event.DoesNotExist:
-        return Response(
-            {'error': 'Event not found or sales closed'},
-            status=status.HTTP_404_NOT_FOUND
-        )
-
-    if event.tickets_remaining < data['quantity']:
-        return Response(
-            {'error': 'Not enough tickets available'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
+        return Response({'error': 'Event not found or sales closed'}, status=404)
 
     total         = Decimal(str(float(event.price) * data['quantity']))
     total_pesewas = int(total * 100)
+    payment_ref   = data['payment_reference']
 
-    payment_ref = data['payment_reference']
     if not verify_paystack_payment(payment_ref, total_pesewas):
-        return Response(
-            {'error': 'Payment could not be verified. Please complete payment first.'},
-            status=status.HTTP_402_PAYMENT_REQUIRED
-        )
+        return Response({'error': 'Payment could not be verified.'}, status=402)
 
     if Ticket.objects.filter(payment_reference=payment_ref).exists():
-        return Response(
-            {'error': 'This payment reference has already been used.'},
-            status=status.HTTP_409_CONFLICT
-        )
+        return Response({'error': 'Payment reference already used.'}, status=409)
 
-    ticket = Ticket(
-        event=event,
-        owner=request.user,
-        original_buyer=request.user,
-        quantity=data['quantity'],
-        price_paid=total,
-        payment_reference=payment_ref,
-        status='active',
-    )
-    ticket.save()
+    # ── Atomic lock — prevent overselling ────────────────────
+    try:
+        with transaction.atomic():
+            event = Event.objects.select_for_update().get(
+                pk=data['event_id'], is_active=True, sales_open=True
+            )
+            if event.tickets_remaining < data['quantity']:
+                return Response({'error': 'Not enough tickets available'}, status=400)
 
+            ticket = Ticket(
+                event=event,
+                owner=request.user,
+                original_buyer=request.user,
+                quantity=data['quantity'],
+                price_paid=total,
+                payment_reference=payment_ref,
+                status='active',
+            )
+            ticket.save()
+
+            event.tickets_sold += data['quantity']
+            event.save(update_fields=['tickets_sold'])
+
+            organizer_wallet, _ = Wallet.objects.get_or_create(user=event.organizer)
+            organizer_amount     = total * Decimal('0.95')
+            organizer_wallet.balance      += organizer_amount
+            organizer_wallet.total_earned += organizer_amount
+            organizer_wallet.save()
+
+            Transaction.objects.create(
+                wallet=organizer_wallet,
+                type='sale',
+                amount=organizer_amount,
+                description=f"{data['quantity']}x {event.name}",
+                reference=payment_ref,
+                status='completed',
+            )
+
+    except Exception as e:
+        print(f"Purchase atomic error: {e}")
+        return Response({'error': 'Purchase failed. Please try again.'}, status=500)
+
+    # ── Outside lock — QR + email + NFT ──────────────────────
     qr_url, qr_base64 = generate_and_upload_qr(ticket)
     if qr_url:
         ticket.qr_image = qr_url
         ticket.save(update_fields=['qr_image'])
 
-    event.tickets_sold += data['quantity']
-    event.save()
-
-    organizer_wallet, _ = Wallet.objects.get_or_create(user=event.organizer)
-    organizer_amount     = total * Decimal('0.95')
-    organizer_wallet.balance      += organizer_amount
-    organizer_wallet.total_earned += organizer_amount
-    organizer_wallet.save()
-
-    Transaction.objects.create(
-        wallet=organizer_wallet,
-        type='sale',
-        amount=organizer_amount,
-        description=f"{data['quantity']}x {event.name}",
-        reference=payment_ref,
-        status='completed',
-    )
-
-    # ── Queue email + NFT mint ────────────────────────────────
     try:
         async_task('tickets.tasks.task_send_ticket_purchase_email', ticket.pk)
     except Exception as e:
@@ -188,15 +191,13 @@ def purchase_ticket(request):
     try:
         async_task('tickets.tasks.task_mint_nft', ticket.pk)
     except Exception as e:
-        print(f"NFT queue failed (non-critical): {e}")
+        print(f"NFT queue failed: {e}")
 
     ticket_data              = TicketSerializer(ticket, context={'request': request}).data
     ticket_data['qr_base64'] = qr_base64
     ticket_data['nft_minting'] = True
     ticket_data['message']     = 'Ticket purchased! NFT minting on Polygon...'
-
-    return Response(ticket_data, status=status.HTTP_201_CREATED)
-
+    return Response(ticket_data, status=201)
 
 # ── Transfer ticket ───────────────────────────────────────────
 @api_view(['POST'])
@@ -438,24 +439,40 @@ def generate_door_code(request, event_id):
 # ── Door staff login ──────────────────────────────────────────
 @api_view(['POST'])
 @permission_classes([AllowAny])
+@ratelimit(key='ip', rate='5/m', method='POST', block=False)
 def door_staff_login(request):
+    if getattr(request, 'limited', False):
+        return Response({'valid': False, 'error': 'Too many attempts. Please wait.'}, status=429)
+
     code = request.data.get('code', '').strip().upper()
     if not code:
         return Response({'valid': False, 'error': 'Code is required'}, status=400)
+
     try:
         door_code = DoorStaffCode.objects.select_related('event').get(
             code=code,
             is_active=True
         )
-        return Response({
-            'valid':      True,
-            'event_id':   door_code.event.id,
-            'event_name': door_code.event.name,
-            'code':       code,
-        })
     except DoorStaffCode.DoesNotExist:
         return Response({'valid': False, 'error': 'Invalid or expired code'}, status=400)
 
+    # ── Check 24hr expiry ─────────────────────────────────────
+    if timezone.now() > door_code.created_at + timedelta(hours=24):
+        door_code.is_active = False
+        door_code.save(update_fields=['is_active'])
+        return Response({'valid': False, 'error': 'Code has expired. Ask organizer for a new one.'}, status=400)
+
+    # ── One-time use — deactivate after login ─────────────────
+    door_code.is_active = False
+    door_code.used_at   = timezone.now()
+    door_code.save(update_fields=['is_active', 'used_at'])
+
+    return Response({
+        'valid':      True,
+        'event_id':   door_code.event.id,
+        'event_name': door_code.event.name,
+        'code':       code,
+    })
 
 # ── Event tickets list ────────────────────────────────────────
 @api_view(['GET'])
