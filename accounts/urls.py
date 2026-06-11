@@ -28,4 +28,5 @@ urlpatterns = [
     path('admin/transactions/',                   views.admin_transactions,  name='admin-transactions'),
     path('admin/users/<int:user_id>/suspend/',    views.admin_suspend_user,  name='admin-suspend-user'),
     path('admin/events/<int:event_id>/toggle/',   views.admin_toggle_event,  name='admin-toggle-event'),
+    path('google/',  views.google_auth,  name='google-auth'),
 ]

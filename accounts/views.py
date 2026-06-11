@@ -7,12 +7,14 @@ from django.contrib.auth import authenticate
 from django.contrib.auth.tokens import default_token_generator
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
+from django.utils import timezone
 from django.conf import settings
 from django_ratelimit.decorators import ratelimit
 from django_q.tasks import async_task
 from .serializers import RegisterSerializer, LoginSerializer, UserSerializer
 from .models import Notification, User
 from django.core.cache import cache
+from datetime import timedelta
 import threading
 
 
@@ -43,7 +45,6 @@ def register(request):
         user   = serializer.save()
         tokens = get_tokens(user)
 
-        # ── Queue welcome + verification emails ───────────────
         try:
             async_task('accounts.tasks.task_send_welcome_and_verification', user.pk)
         except Exception as e:
@@ -68,19 +69,18 @@ def login(request):
     email = request.data.get('email', '').strip().lower()
 
     # ── Check lockout ─────────────────────────────────────────
-    lockout_key    = f"login_lockout_{email}"
-    fail_key       = f"login_fails_{email}"
-    locked_until   = cache.get(lockout_key)
+    lockout_key  = f"login_lockout_{email}"
+    fail_key     = f"login_fails_{email}"
+    locked_until = cache.get(lockout_key)
 
     if locked_until:
-        remaining = int((locked_until - timezone.now()).total_seconds() / 60) + 1
+        remaining = max(1, int((locked_until - timezone.now()).total_seconds() / 60) + 1)
         return Response({
             'error': f'Account temporarily locked. Try again in {remaining} minute(s).'
         }, status=429)
 
     serializer = LoginSerializer(data=request.data)
     if serializer.is_valid():
-        # ── Success — clear fail count ────────────────────────
         cache.delete(fail_key)
         cache.delete(lockout_key)
         user   = serializer.validated_data['user']
@@ -89,20 +89,19 @@ def login(request):
 
     # ── Failed login — increment counter ─────────────────────
     fails = cache.get(fail_key, 0) + 1
-    cache.set(fail_key, fails, timeout=600)  # 10 min window
+    cache.set(fail_key, fails, timeout=600)
 
     if fails >= 5:
-        from django.utils import timezone as tz
-        from datetime import timedelta
-        lockout_until = tz.now() + timedelta(minutes=5)
+        lockout_until = timezone.now() + timedelta(minutes=5)
         cache.set(lockout_key, lockout_until, timeout=300)
         cache.delete(fail_key)
         print(f"🔒 Account locked: {email} after {fails} failed attempts")
         return Response({
-            'error': 'Too many failed attempts. Account locked for 15 minutes.'
+            'error': 'Too many failed attempts. Account locked for 5 minutes.'
         }, status=429)
 
     return Response(serializer.errors, status=400)
+
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -128,7 +127,6 @@ def update_profile(request):
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
-
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 @ratelimit(key='user', rate='5/m', method='POST', block=False)
@@ -144,19 +142,16 @@ def change_password(request):
             {'error': 'Both current and new password are required'},
             status=status.HTTP_400_BAD_REQUEST
         )
-
     if len(new_password) < 8:
         return Response(
             {'error': 'New password must be at least 8 characters'},
             status=status.HTTP_400_BAD_REQUEST
         )
-
     if not request.user.check_password(current_password):
         return Response(
             {'error': 'Current password is incorrect'},
             status=status.HTTP_400_BAD_REQUEST
         )
-
     if current_password == new_password:
         return Response(
             {'error': 'New password must be different from current password'},
@@ -172,7 +167,6 @@ def change_password(request):
 @api_view(['PATCH'])
 @permission_classes([IsAuthenticated])
 def update_wallet(request):
-    """Save MetaMask wallet address"""
     wallet_address = request.data.get('wallet_address', '').strip()
     if not wallet_address:
         return Response({'error': 'Wallet address required'}, status=400)
@@ -180,12 +174,10 @@ def update_wallet(request):
         return Response({'error': 'Invalid Ethereum wallet address'}, status=400)
     request.user.wallet_address = wallet_address
     request.user.save(update_fields=['wallet_address'])
-    print(f"✅ Wallet linked for {request.user.email}: {wallet_address}")
     return Response({
         'message':        'Wallet connected successfully',
         'wallet_address': wallet_address,
     })
-
 
 
 @api_view(['POST'])
@@ -221,7 +213,6 @@ def forgot_password(request):
     uid       = urlsafe_base64_encode(force_bytes(user.pk))
     reset_url = f"{getattr(settings, 'FRONTEND_URL', 'https://master-events-bi7m.vercel.app')}?uid={uid}&token={token}"
 
-    # ── Queue password reset email ────────────────────────────
     try:
         async_task('accounts.tasks.task_send_password_reset_email', user.pk, reset_url)
     except Exception as e:
@@ -243,12 +234,8 @@ def reset_password(request):
 
     if not uid or not token or not new_password:
         return Response({'error': 'Missing required fields'}, status=status.HTTP_400_BAD_REQUEST)
-
     if len(new_password) < 8:
-        return Response(
-            {'error': 'Password must be at least 8 characters'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
+        return Response({'error': 'Password must be at least 8 characters'}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
         user_id = force_str(urlsafe_base64_decode(uid))
@@ -257,10 +244,7 @@ def reset_password(request):
         return Response({'error': 'Invalid reset link'}, status=status.HTTP_400_BAD_REQUEST)
 
     if not default_token_generator.check_token(user, token):
-        return Response(
-            {'error': 'Reset link expired or invalid'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
+        return Response({'error': 'Reset link expired or invalid'}, status=status.HTTP_400_BAD_REQUEST)
 
     user.set_password(new_password)
     user.save()
@@ -356,7 +340,6 @@ def test_email(request):
         'DEFAULT_FROM':       getattr(settings, 'DEFAULT_FROM_EMAIL', 'NOT SET'),
     }
 
-    # ── Keep threading for test endpoint — debug only ─────────
     def _send():
         try:
             resend.api_key = settings.RESEND_API_KEY
@@ -404,7 +387,6 @@ def admin_login(request):
     )
 
 
-# ── Super Admin helpers ───────────────────────────────────────
 def is_super_admin(user):
     return user.is_authenticated and user.role == 'super_admin'
 
@@ -417,7 +399,7 @@ def admin_overview(request):
 
     from events.models import Event
     from tickets.models import Ticket
-    from payments.models import Wallet, Transaction
+    from payments.models import Wallet
 
     total_users      = User.objects.count()
     total_attendees  = User.objects.filter(role='attendee').count()
@@ -479,19 +461,19 @@ def admin_events(request):
     from events.models import Event
     events = Event.objects.select_related('organizer').order_by('-created_at')[:100]
     data = [{
-        'id':               e.id,
-        'name':             e.name,
-        'organizer':        e.organizer.full_name,
-        'organizer_email':  e.organizer.email,
-        'date':             str(e.date),
-        'venue':            e.venue,
-        'category':         e.category,
-        'price':            float(e.price),
-        'total_tickets':    e.total_tickets,
-        'tickets_sold':     e.tickets_sold,
-        'sales_open':       e.sales_open,
-        'is_active':        e.is_active,
-        'revenue':          round(float(e.price) * e.tickets_sold * 0.95, 2),
+        'id':             e.id,
+        'name':           e.name,
+        'organizer':      e.organizer.full_name,
+        'organizer_email':e.organizer.email,
+        'date':           str(e.date),
+        'venue':          e.venue,
+        'category':       e.category,
+        'price':          float(e.price),
+        'total_tickets':  e.total_tickets,
+        'tickets_sold':   e.tickets_sold,
+        'sales_open':     e.sales_open,
+        'is_active':      e.is_active,
+        'revenue':        round(float(e.price) * e.tickets_sold * 0.95, 2),
     } for e in events]
     return Response(data)
 
@@ -554,8 +536,8 @@ def admin_toggle_event(request, event_id):
 def _send_verification_email(user):
     from .models import EmailVerificationToken
     EmailVerificationToken.objects.filter(user=user).delete()
-    vt         = EmailVerificationToken.objects.create(user=user)
-    token_str  = str(vt.token)
+    vt        = EmailVerificationToken.objects.create(user=user)
+    token_str = str(vt.token)
     verify_url = f"{getattr(settings, 'FRONTEND_URL', 'https://master-events-bi7m.vercel.app')}?verify={token_str}"
 
     import resend
@@ -612,8 +594,6 @@ def verify_email(request):
         return Response({'error': 'Token is required'}, status=400)
 
     from .models import EmailVerificationToken
-    from django.utils import timezone
-    from datetime import timedelta
     import uuid
 
     try:
@@ -656,10 +636,61 @@ def resend_verification(request):
     if user.is_verified:
         return Response({'message': 'This email is already verified.'})
 
-    # ── Queue resend verification ─────────────────────────────
     try:
         async_task('accounts.tasks.task_send_resend_verification', user.pk)
     except Exception as e:
         print(f"Resend verification queue failed: {e}")
 
     return Response({'message': 'Verification email sent. Check your inbox.'})
+
+
+# ── Google OAuth ──────────────────────────────────────────────
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def google_auth(request):
+    email      = request.data.get('email', '').strip().lower()
+    first_name = request.data.get('first_name', '')
+    last_name  = request.data.get('last_name', '')
+    google_id  = request.data.get('google_id', '')
+    role       = request.data.get('role', 'attendee')
+
+    if not email or not google_id:
+        return Response({'error': 'Email and Google ID required'}, status=400)
+
+    if role not in ['attendee', 'organizer']:
+        role = 'attendee'
+
+    try:
+        user, created = User.objects.get_or_create(
+            email=email,
+            defaults={
+                'first_name':  first_name,
+                'last_name':   last_name,
+                'username':    email,
+                'is_verified': True,
+                'role':        role,
+            }
+        )
+
+        if not created and not user.first_name and first_name:
+            user.first_name = first_name
+            user.last_name  = last_name
+            user.save(update_fields=['first_name', 'last_name'])
+
+        # Send welcome email for new Google users
+        if created:
+            try:
+                async_task('accounts.tasks.task_send_welcome_and_verification', user.pk)
+            except Exception as e:
+                print(f"Google welcome email failed: {e}")
+
+        tokens = get_tokens(user)
+        return Response({
+            'user':    UserSerializer(user).data,
+            'tokens':  tokens,
+            'created': created,
+        })
+
+    except Exception as e:
+        print(f"Google auth error: {e}")
+        return Response({'error': str(e)}, status=500)
