@@ -537,11 +537,23 @@ def resale_listings(request):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def buy_resale_ticket(request):
+    from payments.models import AttendeeWallet
+
     ticket_id   = request.data.get('ticket_id', '')
     payment_ref = request.data.get('payment_reference', '')
 
     if not ticket_id:
         return Response({'error': 'ticket_id required'}, status=400)
+
+    # ── Idempotency: if THIS user already has a ticket from this
+    #    payment ref, return it instead of erroring ────────────
+    existing = Ticket.objects.filter(
+        payment_reference=payment_ref, owner=request.user
+    ).select_related('event', 'owner').first()
+    if existing:
+        ticket_data = TicketSerializer(existing, context={'request': request}).data
+        ticket_data['nft_minting'] = not bool(existing.nft_tx_hash)
+        return Response(ticket_data, status=200)
 
     try:
         ticket = Ticket.objects.select_related('event', 'owner').get(
@@ -584,14 +596,15 @@ def buy_resale_ticket(request):
         new_ticket.qr_image = qr_url
         new_ticket.save(update_fields=['qr_image'])
 
-    seller_wallet, _ = Wallet.objects.get_or_create(user=seller)
+    # ── Credit ATTENDEE wallet (not organizer Wallet) ──────────
+    seller_wallet, _ = AttendeeWallet.objects.get_or_create(user=seller)
     seller_amount     = (ticket.resale_price or Decimal('0')) * Decimal('0.98')
     seller_wallet.balance      += seller_amount
     seller_wallet.total_earned += seller_amount
     seller_wallet.save()
 
     Transaction.objects.create(
-        wallet=seller_wallet,
+        att_wallet=seller_wallet,
         type='resale_sale',
         amount=seller_amount,
         description=f"Resale — {ticket.event.name}",
@@ -599,7 +612,6 @@ def buy_resale_ticket(request):
         status='completed',
     )
 
-    # ── Queue resale notifications + NFT mint ─────────────────
     try:
         async_task('tickets.tasks.task_send_resale_notifications',
                    ticket.pk, seller.pk, request.user.pk, float(seller_amount))
@@ -616,7 +628,6 @@ def buy_resale_ticket(request):
     ticket_data['nft_minting'] = True
 
     return Response(ticket_data, status=201)
-
 
 # ── List ticket for resale ────────────────────────────────────
 @api_view(['POST'])
