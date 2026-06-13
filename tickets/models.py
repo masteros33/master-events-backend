@@ -9,7 +9,7 @@ class Ticket(models.Model):
         ('redeemed',    'Redeemed'),
         ('transferred', 'Transferred'),
         ('refunded',    'Refunded'),
-        ('resale',      'Resale'),   # ✅ add resale status
+        ('resale',      'Resale'),
     ]
 
     id              = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -30,6 +30,10 @@ class Ticket(models.Model):
     owner_wallet    = models.CharField(max_length=100, blank=True, null=True)
     payment_reference = models.CharField(max_length=100, blank=True, null=True, unique=True)
     nft_mint_failed   = models.BooleanField(default=False)
+
+    # ── NEW: backup PDF QR — single-use, ownership-locked ──────
+    pdf_redemption_used = models.BooleanField(default=False)
+
     redeemed_at     = models.DateTimeField(null=True, blank=True)
     created_at      = models.DateTimeField(auto_now_add=True)
 
@@ -44,7 +48,6 @@ class Ticket(models.Model):
     def save(self, *args, **kwargs):
         if not self.ticket_id:
             self.ticket_id = f"TKT-{str(self.id)[:8].upper()}-GH"
-        # ✅ Fix: qr_data uses ticket_id format that verify_ticket can find
         if not self.qr_data:
             self.qr_data = f"MASTER-EVENTS:{self.id}:{self.event_id}"
         super().save(*args, **kwargs)
@@ -56,7 +59,7 @@ class DoorStaffCode(models.Model):
     created_by = models.ForeignKey(User, on_delete=models.CASCADE)
     is_active  = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
-    used_at    = models.DateTimeField(null=True, blank=True) 
+    used_at    = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         db_table = 'door_staff_codes'
@@ -73,3 +76,42 @@ class TicketTransfer(models.Model):
 
     class Meta:
         db_table = 'ticket_transfers'
+
+
+class Registration(models.Model):
+    """For FREE events — attendee registers, gets a QR-based entry pass (no payment)"""
+    STATUS_CHOICES = [
+        ('active',   'Active'),
+        ('redeemed', 'Redeemed'),
+        ('cancelled','Cancelled'),
+    ]
+
+    id               = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    registration_id  = models.CharField(max_length=50, unique=True)
+    event            = models.ForeignKey(Event, on_delete=models.CASCADE, related_name='registrations')
+    attendee         = models.ForeignKey(User, on_delete=models.CASCADE, related_name='registrations')
+    quantity         = models.IntegerField(default=1)
+    status           = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
+    qr_data          = models.CharField(max_length=500, unique=True, blank=True)
+    qr_image         = models.CharField(max_length=500, blank=True, null=True)
+
+    # ── NEW: same single-use backup lock as Ticket ─────────────
+    pdf_redemption_used = models.BooleanField(default=False)
+
+    redeemed_at      = models.DateTimeField(null=True, blank=True)
+    created_at       = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'registrations'
+        ordering = ['-created_at']
+        unique_together = ('event', 'attendee')
+
+    def __str__(self):
+        return f"{self.registration_id} - {self.event.name}"
+
+    def save(self, *args, **kwargs):
+        if not self.registration_id:
+            self.registration_id = f"REG-{str(self.id)[:8].upper()}"
+        if not self.qr_data:
+            self.qr_data = f"MASTER-EVENTS-REG:{self.id}:{self.event_id}"
+        super().save(*args, **kwargs)
