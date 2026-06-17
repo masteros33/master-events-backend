@@ -7,7 +7,10 @@ from django.conf import settings
 from .models import Ticket, DoorStaffCode, TicketTransfer
 from .serializers import (
     TicketSerializer, PurchaseSerializer, TransferSerializer,
-    VerifyTicketSerializer, DoorStaffCodeSerializer, verify_dynamic_qr_token
+    VerifyTicketSerializer, DoorStaffCodeSerializer,
+    verify_dynamic_qr_token, verify_static_qr_token,
+    check_current_owner_hash, generate_static_qr_token,
+    generate_qr_base64,
 )
 from events.models import Event
 from accounts.models import User
@@ -89,6 +92,20 @@ def generate_and_upload_qr(ticket):
     except Exception as e:
         print(f"⚠️ QR Cloudinary upload failed: {e}")
         return None, qr_base64
+
+
+# ── Static (Tier 2 / PDF backup) QR helper ─────────────────────
+def generate_static_qr_base64(ticket):
+    """
+    Generate the ownership-locked, single-use backup QR (Tier 2)
+    for embedding in PDF/email tickets.
+    """
+    try:
+        static_content = generate_static_qr_token(str(ticket.id), ticket.event_id, ticket.owner_id)
+        return generate_qr_base64(static_content)
+    except Exception as e:
+        print(f"Static QR generation error: {e}")
+        return None
 
 
 # ── My tickets ────────────────────────────────────────────────
@@ -183,8 +200,10 @@ def purchase_ticket(request):
         ticket.qr_image = qr_url
         ticket.save(update_fields=['qr_image'])
 
+    static_qr_base64 = generate_static_qr_base64(ticket)
+
     try:
-        async_task('tickets.tasks.task_send_ticket_purchase_email', ticket.pk)
+        async_task('tickets.tasks.task_send_ticket_purchase_email', ticket.pk, static_qr_base64)
     except Exception as e:
         print(f"Email queue failed: {e}")
 
@@ -195,6 +214,7 @@ def purchase_ticket(request):
 
     ticket_data              = TicketSerializer(ticket, context={'request': request}).data
     ticket_data['qr_base64'] = qr_base64
+    ticket_data['static_qr_base64'] = static_qr_base64
     ticket_data['nft_minting'] = True
     ticket_data['message']     = 'Ticket purchased! NFT minting on Polygon...'
     return Response(ticket_data, status=201)
@@ -260,10 +280,12 @@ def transfer_ticket(request):
         new_ticket.qr_image = qr_url
         new_ticket.save(update_fields=['qr_image'])
 
+    new_static_qr_base64 = generate_static_qr_base64(new_ticket)
+
     # ── Queue transfer email + NFT mint ───────────────────────
     try:
         async_task('tickets.tasks.task_send_transfer_email',
-                   ticket.pk, from_user.pk, to_user.pk)
+                   ticket.pk, from_user.pk, to_user.pk, new_ticket.pk, new_static_qr_base64)
     except Exception as e:
         print(f"Transfer email queue failed: {e}")
 
@@ -278,7 +300,7 @@ def transfer_ticket(request):
     })
 
 
-# ── Ticket lookup helper ──────────────────────────────────────
+# ── Ticket lookup helper (Tier 1 — dynamic QR only) ────────────
 def _find_ticket(qr_data):
     ticket_id_from_qr, _ = verify_dynamic_qr_token(qr_data)
     if ticket_id_from_qr:
@@ -316,7 +338,19 @@ def public_scan_ticket(request):
     if not qr_data:
         return Response({'valid': False, 'reason': 'No QR data provided'}, status=400)
 
-    ticket = _find_ticket(qr_data)
+    ticket = None
+
+    # Static (Tier 2) QR — look up by embedded obj_id, no ownership check needed for public scan
+    if qr_data.startswith('MASTER-EVENTS-STATIC:'):
+        obj_id, _, _ = verify_static_qr_token(qr_data)
+        if obj_id:
+            try:
+                ticket = Ticket.objects.select_related('event', 'owner').get(id=obj_id)
+            except Ticket.DoesNotExist:
+                ticket = None
+    else:
+        ticket = _find_ticket(qr_data)
+
     if not ticket:
         return Response({'valid': False, 'reason': 'Ticket not found or QR expired'}, status=404)
 
@@ -356,9 +390,43 @@ def verify_ticket(request):
     qr_data  = data['qr_data'].strip()
     event_id = data.get('event_id', 0)
 
-    ticket = _find_ticket(qr_data)
-    if not ticket:
-        return Response({'valid': False, 'reason': 'Ticket not found or QR expired'}, status=404)
+    is_pdf_backup = False
+
+    # ── TIER 2: Static PDF/email QR — ownership-locked, single-use ──
+    if qr_data.startswith('MASTER-EVENTS-STATIC:'):
+        is_pdf_backup = True
+        obj_id, qr_event_id, owner_hash = verify_static_qr_token(qr_data)
+        if not obj_id:
+            return Response({'valid': False, 'reason': 'Invalid or tampered backup QR'}, status=400)
+
+        try:
+            ticket = Ticket.objects.select_related('event', 'owner').get(id=obj_id)
+        except Ticket.DoesNotExist:
+            return Response({'valid': False, 'reason': 'Ticket not found'}, status=404)
+
+        # ── Ownership check: did this ticket get transferred/resold since PDF was issued? ──
+        if not check_current_owner_hash(str(ticket.id), ticket.owner_id, owner_hash):
+            return Response({
+                'valid':  False,
+                'reason': 'This backup ticket has been transferred to a new owner. '
+                          'It is no longer valid — the current owner must use their in-app QR.',
+                'event_name': ticket.event.name,
+            }, status=400)
+
+        # ── Single-use check: has this PDF QR already been redeemed via backup? ──
+        if ticket.pdf_redemption_used:
+            return Response({
+                'valid':  False,
+                'reason': 'This backup QR has already been used once and cannot be reused.',
+                'holder': ticket.owner.get_full_name() or ticket.owner.email,
+                'event_name': ticket.event.name,
+            }, status=400)
+
+    else:
+        # ── TIER 1: Dynamic in-app QR (existing flow) ──────────
+        ticket = _find_ticket(qr_data)
+        if not ticket:
+            return Response({'valid': False, 'reason': 'Ticket not found or QR expired'}, status=404)
 
     if event_id and event_id != 0 and ticket.event.id != event_id:
         return Response({
@@ -387,7 +455,12 @@ def verify_ticket(request):
 
     ticket.status      = 'redeemed'
     ticket.redeemed_at = timezone.now()
-    ticket.save()
+
+    if is_pdf_backup:
+        ticket.pdf_redemption_used = True
+        ticket.save(update_fields=['status', 'redeemed_at', 'pdf_redemption_used'])
+    else:
+        ticket.save(update_fields=['status', 'redeemed_at'])
 
     # ── Queue redeemed notification ───────────────────────────
     try:
@@ -407,6 +480,7 @@ def verify_ticket(request):
         'is_transfer':    ticket.is_resale,
         'nft_token_id':   ticket.nft_token_id,
         'redeemed_at':    ticket.redeemed_at,
+        'is_pdf_backup':  is_pdf_backup,
         'blockchain_url': get_polygon_explorer_url(ticket.nft_tx_hash) if ticket.nft_tx_hash else None,
     })
 
@@ -596,6 +670,8 @@ def buy_resale_ticket(request):
         new_ticket.qr_image = qr_url
         new_ticket.save(update_fields=['qr_image'])
 
+    new_static_qr_base64 = generate_static_qr_base64(new_ticket)
+
     # ── Credit ATTENDEE wallet (not organizer Wallet) ──────────
     seller_wallet, _ = AttendeeWallet.objects.get_or_create(user=seller)
     seller_amount     = (ticket.resale_price or Decimal('0')) * Decimal('0.98')
@@ -625,6 +701,7 @@ def buy_resale_ticket(request):
 
     ticket_data              = TicketSerializer(new_ticket, context={'request': request}).data
     ticket_data['qr_base64'] = qr_base64
+    ticket_data['static_qr_base64'] = new_static_qr_base64
     ticket_data['nft_minting'] = True
 
     return Response(ticket_data, status=201)
@@ -704,3 +781,93 @@ def cancel_resale(request):
     ticket.save(update_fields=['status', 'resale_price'])
 
     return Response({'message': 'Resale listing cancelled', 'ticket_id': str(ticket.ticket_id)})
+
+
+
+
+# ── Register for free event ───────────────────────────────────
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@ratelimit(key='user', rate='10/m', method='POST', block=False)
+def register_free_event(request):
+    if getattr(request, 'limited', False):
+        return Response({'error': 'Too many attempts.'}, status=429)
+
+    from .models import Registration
+    from .serializers import RegistrationSerializer, RegisterFreeEventSerializer
+
+    serializer = RegisterFreeEventSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=400)
+
+    data = serializer.validated_data
+
+    try:
+        event = Event.objects.get(
+            pk=data['event_id'], is_active=True, sales_open=True, event_type='free'
+        )
+    except Event.DoesNotExist:
+        return Response({'error': 'Free event not found or registration closed'}, status=404)
+
+    # Check already registered
+    if Registration.objects.filter(event=event, attendee=request.user).exists():
+        reg = Registration.objects.get(event=event, attendee=request.user)
+        return Response(RegistrationSerializer(reg, context={'request': request}).data, status=200)
+
+    # Check capacity
+    if event.tickets_remaining < data['quantity']:
+        return Response({'error': 'Not enough spots available'}, status=400)
+
+    reg = Registration(
+        event=event,
+        attendee=request.user,
+        quantity=data['quantity'],
+        status='active',
+    )
+    reg.save()
+
+    event.tickets_sold += data['quantity']
+    event.save(update_fields=['tickets_sold'])
+
+    # Generate and upload QR
+    qr_content = reg.qr_data
+    import qrcode
+    qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=4)
+    qr.add_data(qr_content)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buffer = BytesIO()
+    img.save(buffer, format='PNG')
+    buffer.seek(0)
+    qr_base64 = base64.b64encode(buffer.getvalue()).decode()
+
+    try:
+        buffer.seek(0)
+        result = cloudinary.uploader.upload(
+            buffer,
+            folder="master_events/qr_codes",
+            public_id=f"qr_{reg.registration_id}",
+            resource_type="image",
+            overwrite=True,
+        )
+        reg.qr_image = result['secure_url']
+        reg.save(update_fields=['qr_image'])
+    except Exception as e:
+        print(f"QR upload failed: {e}")
+
+    # Generate static backup QR for PDF email
+    from .serializers import generate_static_qr_token, generate_qr_base64
+    static_content  = generate_static_qr_token(str(reg.id), reg.event_id, reg.attendee_id)
+    static_qr_base64 = generate_qr_base64(static_content)
+
+    # Queue confirmation email
+    try:
+        async_task('tickets.tasks.task_send_registration_email', str(reg.pk), static_qr_base64)
+    except Exception as e:
+        print(f"Registration email queue failed: {e}")
+
+    reg_data = RegistrationSerializer(reg, context={'request': request}).data
+    reg_data['qr_base64']        = qr_base64
+    reg_data['static_qr_base64'] = static_qr_base64
+    reg_data['message']          = f'Registered for {event.name}! Check your email for your entry pass.'
+    return Response(reg_data, status=201)

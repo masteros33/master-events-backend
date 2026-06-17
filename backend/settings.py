@@ -285,8 +285,8 @@ BACKEND_URL         = os.getenv('BACKEND_URL', 'https://master-events-backend.on
 FRONTEND_URL        = os.getenv('FRONTEND_URL', 'https://master-events-bi7m.vercel.app')
 
 # ── Email via Resend ──────────────────────────────────────────
+DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'Master Events <noreply@masterevents.events>')
 RESEND_API_KEY     = os.environ.get('RESEND_API_KEY', '')
-DEFAULT_FROM_EMAIL = "Master Events <onboarding@resend.dev>"
 
 # ── Admin alerts ──────────────────────────────────────────────
 ADMINS       = [('Master Events Admin', os.getenv('ADMIN_EMAIL', 'mastereventgh@gmail.com'))]

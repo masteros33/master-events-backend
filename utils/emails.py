@@ -432,3 +432,79 @@ def notify_password_reset(user, reset_url):
         text=f"Hi {user.first_name},\n\nReset your password (expires in 30 minutes):\n{reset_url}\n\nIf you didn't request this, ignore this email.",
     )
     return True
+
+
+    def notify_free_registration(reg, static_qr_base64=None):
+    """Email attendee their free event registration pass"""
+    user    = reg.attendee
+    event   = reg.event
+    app_url = getattr(settings, 'FRONTEND_URL', 'https://master-events-bi7m.vercel.app')
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
+    <body style="margin:0;padding:0;background:#0f0f0f;font-family:'Helvetica Neue',Arial,sans-serif;">
+        <div style="max-width:600px;margin:0 auto;padding:24px 16px;">
+            <div style="background:linear-gradient(135deg,#f5a623,#e8920f);border-radius:20px 20px 0 0;padding:28px 32px;text-align:center;">
+                <div style="font-size:36px;margin-bottom:8px;">🎟️</div>
+                <h1 style="margin:0;color:#fff;font-size:22px;font-weight:900;">You're Registered!</h1>
+                <p style="margin:6px 0 0;color:rgba(255,255,255,0.85);font-size:13px;">Your entry pass for {event.name}</p>
+            </div>
+            <div style="background:#1a1a1a;padding:28px 32px;border-left:1px solid #2a2a2a;border-right:1px solid #2a2a2a;">
+                <p style="color:rgba(255,255,255,0.8);font-size:15px;margin:0 0 20px;">
+                    Hi <strong style="color:#fff;">{user.first_name}</strong>, your spot is confirmed!
+                </p>
+                <div style="background:#111;border:1px solid #2a2a2a;border-radius:14px;padding:18px;margin-bottom:20px;">
+                    <div style="padding:8px 0;border-bottom:1px solid #222;display:flex;justify-content:space-between;">
+                        <span style="color:rgba(255,255,255,0.4);font-size:13px;">Event</span>
+                        <span style="color:#fff;font-size:13px;font-weight:700;">{event.name}</span>
+                    </div>
+                    <div style="padding:8px 0;border-bottom:1px solid #222;display:flex;justify-content:space-between;">
+                        <span style="color:rgba(255,255,255,0.4);font-size:13px;">Date</span>
+                        <span style="color:#fff;font-size:13px;">{event.date}</span>
+                    </div>
+                    <div style="padding:8px 0;border-bottom:1px solid #222;display:flex;justify-content:space-between;">
+                        <span style="color:rgba(255,255,255,0.4);font-size:13px;">Venue</span>
+                        <span style="color:#fff;font-size:13px;">{event.venue}</span>
+                    </div>
+                    <div style="padding:8px 0;border-bottom:1px solid #222;display:flex;justify-content:space-between;">
+                        <span style="color:rgba(255,255,255,0.4);font-size:13px;">Spots</span>
+                        <span style="color:#fff;font-size:13px;">{reg.quantity}</span>
+                    </div>
+                    <div style="padding:8px 0;display:flex;justify-content:space-between;">
+                        <span style="color:rgba(255,255,255,0.4);font-size:13px;">Entry Pass ID</span>
+                        <span style="color:#f5a623;font-size:13px;font-weight:700;font-family:monospace;">{reg.registration_id}</span>
+                    </div>
+                </div>
+                {'<div style="text-align:center;margin-bottom:20px;"><p style="color:rgba(255,255,255,0.5);font-size:12px;margin-bottom:8px;">Show this QR at the entrance</p><img src="data:image/png;base64,' + static_qr_base64 + '" style="width:180px;height:180px;border-radius:12px;background:#fff;padding:8px;" /></div>' if static_qr_base64 else ''}
+                <div style="background:rgba(245,166,35,0.08);border:1px solid rgba(245,166,35,0.2);border-radius:12px;padding:14px 16px;margin-bottom:24px;">
+                    <div style="color:#f5a623;font-weight:700;font-size:11px;margin-bottom:4px;">🎪 SHOW AT THE GATE</div>
+                    <div style="color:rgba(255,255,255,0.5);font-size:12px;">Present this QR code or your entry pass ID to gain entry. Open the Master Events app for a live rotating QR.</div>
+                </div>
+                <div style="text-align:center;">
+                    <a href="{app_url}" style="background:linear-gradient(135deg,#f5a623,#e8920f);color:#fff;padding:14px 40px;border-radius:12px;text-decoration:none;font-weight:700;font-size:15px;display:inline-block;">
+                        Open Master Events →
+                    </a>
+                </div>
+            </div>
+            <div style="background:#111;border-radius:0 0 20px 20px;border:1px solid #2a2a2a;border-top:none;padding:20px 32px;text-align:center;">
+                <p style="color:rgba(255,255,255,0.2);font-size:11px;margin:0;">© 2026 Master Events · masterevents.events</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    _send_email_async(
+        to_email=user.email,
+        subject=f"🎟️ You're In — {event.name}",
+        html=html,
+        text=(
+            f"Hi {user.first_name},\n\n"
+            f"You're registered for {event.name}!\n\n"
+            f"Date: {event.date}\n"
+            f"Venue: {event.venue}\n"
+            f"Entry Pass ID: {reg.registration_id}\n\n"
+            f"Open Master Events to view your QR code: {app_url}"
+        ),
+    )

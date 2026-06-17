@@ -36,20 +36,20 @@ def task_mint_nft(ticket_id):
         raise
 
 
-def task_send_ticket_purchase_email(ticket_id):
-    """Send purchase confirmation email"""
+def task_send_ticket_purchase_email(ticket_id, static_qr_base64=None):
+    """Send purchase confirmation email — static_qr_base64 reserved for PDF attachment (Phase 2)"""
     try:
         from tickets.models import Ticket
         from utils.emails import notify_ticket_purchase
         ticket = Ticket.objects.get(pk=ticket_id)
-        notify_ticket_purchase(ticket)
+        notify_ticket_purchase(ticket, static_qr_base64=static_qr_base64)
         print(f"✅ [Q] Purchase email sent for {ticket.ticket_id}")
     except Exception as e:
         print(f"❌ [Q] task_send_ticket_purchase_email error: {e}")
         raise
 
 
-def task_send_transfer_email(ticket_id, from_user_id, to_user_id):
+def task_send_transfer_email(ticket_id, from_user_id, to_user_id, new_ticket_id=None, static_qr_base64=None):
     """Send transfer emails to both parties"""
     try:
         from tickets.models import Ticket
@@ -58,7 +58,15 @@ def task_send_transfer_email(ticket_id, from_user_id, to_user_id):
         ticket    = Ticket.objects.get(pk=ticket_id)
         from_user = User.objects.get(pk=from_user_id)
         to_user   = User.objects.get(pk=to_user_id)
-        notify_ticket_transfer(ticket, from_user, to_user)
+
+        new_ticket = None
+        if new_ticket_id:
+            try:
+                new_ticket = Ticket.objects.get(pk=new_ticket_id)
+            except Ticket.DoesNotExist:
+                new_ticket = None
+
+        notify_ticket_transfer(ticket, from_user, to_user, new_ticket=new_ticket, static_qr_base64=static_qr_base64)
         print(f"✅ [Q] Transfer emails sent for {ticket.ticket_id}")
     except Exception as e:
         print(f"❌ [Q] task_send_transfer_email error: {e}")
@@ -145,4 +153,21 @@ def task_retry_failed_mints():
         retry_failed_mints()
     except Exception as e:
         print(f"❌ [Q] task_retry_failed_mints error: {e}")
+        raise
+
+
+
+
+
+
+def task_send_registration_email(registration_id, static_qr_base64=None):
+    """Send free event registration confirmation email"""
+    try:
+        from tickets.models import Registration
+        from utils.emails import notify_free_registration
+        reg = Registration.objects.select_related('event', 'attendee').get(pk=registration_id)
+        notify_free_registration(reg, static_qr_base64=static_qr_base64)
+        print(f"✅ [Q] Registration email sent for {reg.registration_id}")
+    except Exception as e:
+        print(f"❌ [Q] task_send_registration_email error: {e}")
         raise

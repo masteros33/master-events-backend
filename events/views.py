@@ -4,11 +4,10 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
 from .models import Event
-from .serializers import EventSerializer, EventCreateSerializer
+from .serializers import EventSerializer, EventCreateSerializer, PublicEventSerializer
 
 
 def upload_to_cloudinary(source):
-    """Upload file or base64 or URL to Cloudinary. Returns URL string or None."""
     try:
         import cloudinary.uploader
         result = cloudinary.uploader.upload(
@@ -26,21 +25,28 @@ def upload_to_cloudinary(source):
         print(f"⚠️ Cloudinary upload failed: {e}")
         return None
 
+
+# ── Public event list ─────────────────────────────────────────
 @api_view(['GET', 'HEAD'])
 @permission_classes([AllowAny])
 def event_list(request):
     if request.method == 'HEAD':
         return Response(status=200)
-    city     = request.query_params.get('city')
-    category = request.query_params.get('category')
-    search   = request.query_params.get('search')
-    events   = Event.objects.filter(is_active=True, sales_open=True)
-    if city:     events = events.filter(city__icontains=city)
-    if category: events = events.filter(category=category)
-    if search:   events = events.filter(name__icontains=search)
+    city       = request.query_params.get('city')
+    category   = request.query_params.get('category')
+    search     = request.query_params.get('search')
+    event_type = request.query_params.get('event_type')
+    currency   = request.query_params.get('currency')
+    events     = Event.objects.filter(is_active=True, sales_open=True)
+    if city:       events = events.filter(city__icontains=city)
+    if category:   events = events.filter(category=category)
+    if search:     events = events.filter(name__icontains=search)
+    if event_type: events = events.filter(event_type=event_type)
+    if currency:   events = events.filter(currency=currency)
     return Response(EventSerializer(events, many=True).data)
 
 
+# ── Public event detail by ID ─────────────────────────────────
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def event_detail(request, pk):
@@ -51,6 +57,74 @@ def event_detail(request, pk):
     return Response(EventSerializer(event).data)
 
 
+# ── NEW: Public event landing page by slug ────────────────────
+# This powers tgma.masterevents.events → /api/events/slug/tgma/
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def event_by_slug(request, slug):
+    try:
+        event = Event.objects.get(slug=slug, is_active=True)
+    except Event.DoesNotExist:
+        return Response({'error': 'Event not found'}, status=404)
+    return Response(PublicEventSerializer(event).data)
+
+
+# ── NEW: Organizer event attendees/registrations ──────────────
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def event_attendees(request, pk):
+    """Returns both paid ticket holders and free registrations for an event"""
+    try:
+        event = Event.objects.get(pk=pk, organizer=request.user)
+    except Event.DoesNotExist:
+        return Response({'error': 'Event not found'}, status=404)
+
+    from tickets.models import Ticket, Registration
+
+    # Paid ticket holders
+    tickets = Ticket.objects.filter(
+        event=event
+    ).exclude(status='transferred').select_related('owner')
+
+    ticket_data = [{
+        'type':        'ticket',
+        'name':        t.owner.get_full_name() or t.owner.email,
+        'email':       t.owner.email,
+        'quantity':    t.quantity,
+        'amount_paid': float(t.price_paid),
+        'status':      t.status,
+        'ticket_id':   str(t.ticket_id),
+        'joined_at':   t.created_at.isoformat(),
+        'redeemed':    t.status == 'redeemed',
+    } for t in tickets]
+
+    # Free registrations
+    registrations = Registration.objects.filter(
+        event=event
+    ).select_related('attendee')
+
+    reg_data = [{
+        'type':            'registration',
+        'name':            r.attendee.get_full_name() or r.attendee.email,
+        'email':           r.attendee.email,
+        'quantity':        r.quantity,
+        'amount_paid':     0,
+        'status':          r.status,
+        'registration_id': str(r.registration_id),
+        'joined_at':       r.created_at.isoformat(),
+        'redeemed':        r.status == 'redeemed',
+    } for r in registrations]
+
+    return Response({
+        'event_name':          event.name,
+        'event_type':          event.event_type,
+        'total_attendees':     len(ticket_data) + len(reg_data),
+        'ticket_holders':      ticket_data,
+        'registrations':       reg_data,
+    })
+
+
+# ── Create event ──────────────────────────────────────────────
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 @parser_classes([MultiPartParser, FormParser, JSONParser])
@@ -61,49 +135,36 @@ def event_create(request):
             status=status.HTTP_403_FORBIDDEN
         )
 
-    # ── Build plain dict from request (works for JSON + multipart) ──
     data = {}
     for key in request.data:
         val = request.data[key]
-        # QueryDict returns lists for multipart — take first value
         data[key] = val[0] if isinstance(val, list) else val
 
-    # ── Image handling ────────────────────────────────────────
     image_file = request.FILES.get('image')
     image_val  = data.get('image', '')
 
     if image_file:
-        # Real file upload — send to Cloudinary
         url = upload_to_cloudinary(image_file)
         data['image'] = url or ''
-
     elif isinstance(image_val, str) and image_val.startswith('data:image'):
-        # Base64 from frontend
         url = upload_to_cloudinary(image_val)
         data['image'] = url or ''
-
     elif isinstance(image_val, str) and image_val.startswith('http'):
-        # Already a valid URL — keep as is
         data['image'] = image_val
-
     else:
-        # No image or empty string — set to empty
         data['image'] = ''
 
-    # ── Validate and save ────────────────────────────────────
-    serializer = EventCreateSerializer(
-        data=data,
-        context={'request': request}
-    )
+    serializer = EventCreateSerializer(data=data, context={'request': request})
     if serializer.is_valid():
         event = serializer.save()
-        print(f"✅ Event created: {event.name} (id={event.id})")
+        print(f"✅ Event created: {event.name} (id={event.id}, slug={event.slug}, type={event.event_type})")
         return Response(EventSerializer(event).data, status=201)
 
     print(f"❌ Event create validation errors: {serializer.errors}")
     return Response(serializer.errors, status=400)
 
 
+# ── Update event ──────────────────────────────────────────────
 @api_view(['PUT', 'PATCH'])
 @permission_classes([IsAuthenticated])
 @parser_classes([MultiPartParser, FormParser, JSONParser])
@@ -124,17 +185,14 @@ def event_update(request, pk):
     if image_file:
         url = upload_to_cloudinary(image_file)
         if url: data['image'] = url
-
     elif isinstance(image_val, str) and image_val.startswith('data:image'):
         url = upload_to_cloudinary(image_val)
         if url: data['image'] = url
-
     elif isinstance(image_val, str) and image_val.startswith('http'):
         data['image'] = image_val
 
     serializer = EventCreateSerializer(
-        event, data=data, partial=True,
-        context={'request': request}
+        event, data=data, partial=True, context={'request': request}
     )
     if serializer.is_valid():
         serializer.save()
@@ -144,6 +202,7 @@ def event_update(request, pk):
     return Response(serializer.errors, status=400)
 
 
+# ── Delete event ──────────────────────────────────────────────
 @api_view(['DELETE'])
 @permission_classes([IsAuthenticated])
 def event_delete(request, pk):
@@ -156,6 +215,7 @@ def event_delete(request, pk):
     return Response({'message': 'Event deleted'})
 
 
+# ── My events ─────────────────────────────────────────────────
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def my_events(request):
@@ -165,6 +225,7 @@ def my_events(request):
     return Response(EventSerializer(events, many=True).data)
 
 
+# ── Toggle sales ──────────────────────────────────────────────
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def toggle_sales(request, pk):
