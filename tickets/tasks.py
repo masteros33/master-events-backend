@@ -171,3 +171,143 @@ def task_send_registration_email(registration_id, static_qr_base64=None):
     except Exception as e:
         print(f"❌ [Q] task_send_registration_email error: {e}")
         raise
+
+
+
+
+
+
+
+
+
+def task_generate_and_send_pdf_ticket(registration_id):
+    """
+    Generate a PDF ticket for a FREE event registration and email it.
+    The PDF contains: event info, QR code image, registration ID.
+    """
+    try:
+        from tickets.models import Registration
+        from utils.emails import notify_free_registration_with_pdf
+        import qrcode
+        import qrcode.image.svg
+        import base64
+        from io import BytesIO
+
+        reg = Registration.objects.select_related('event', 'attendee').get(pk=registration_id)
+
+        # Generate QR image as base64
+        qr = qrcode.QRCode(version=1, box_size=8, border=2)
+        qr.add_data(reg.qr_data or reg.registration_id)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        qr_b64 = base64.b64encode(buf.getvalue()).decode()
+
+        # Generate PDF as base64
+        pdf_b64 = _generate_ticket_pdf(reg, qr_b64)
+
+        notify_free_registration_with_pdf(reg, qr_b64, pdf_b64)
+        print(f"✅ [Q] PDF ticket sent for registration {reg.registration_id}")
+
+    except Exception as e:
+        print(f"❌ [Q] task_generate_and_send_pdf_ticket error: {e}")
+        raise
+
+
+def _generate_ticket_pdf(reg, qr_b64):
+    """Generate a clean PDF ticket using reportlab."""
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib import colors
+        from reportlab.lib.units import mm
+        from reportlab.pdfgen import canvas as pdf_canvas
+        from io import BytesIO
+        import base64
+
+        buf = BytesIO()
+        W, H = 210*mm, 99*mm  # A5 landscape ticket size
+        c = pdf_canvas.Canvas(buf, pagesize=(W, H))
+
+        # Background
+        c.setFillColorRGB(0.97, 0.97, 0.97)
+        c.rect(0, 0, W, H, fill=1, stroke=0)
+
+        # Orange left strip
+        c.setFillColorRGB(0.976, 0.451, 0.086)
+        c.rect(0, 0, 18*mm, H, fill=1, stroke=0)
+
+        # Rotated "TICKET" text on strip
+        c.saveState()
+        c.setFillColorRGB(1, 1, 1)
+        c.setFont("Helvetica-Bold", 9)
+        c.translate(9*mm, H/2)
+        c.rotate(90)
+        c.drawCentredString(0, 0, "MASTER EVENTS TICKET")
+        c.restoreState()
+
+        # Dashed separator
+        c.setStrokeColorRGB(0.8, 0.8, 0.8)
+        c.setDash(4, 4)
+        c.line(W - 55*mm, 6*mm, W - 55*mm, H - 6*mm)
+        c.setDash()
+
+        # Event name
+        c.setFillColorRGB(0.1, 0.1, 0.1)
+        c.setFont("Helvetica-Bold", 16)
+        name = reg.event.name
+        if len(name) > 30: name = name[:28] + "…"
+        c.drawString(24*mm, H - 22*mm, name)
+
+        # Details
+        c.setFont("Helvetica", 10)
+        c.setFillColorRGB(0.45, 0.45, 0.45)
+        c.drawString(24*mm, H - 33*mm, f"📅  {reg.event.date}")
+        c.drawString(24*mm, H - 43*mm, f"📍  {reg.event.venue}")
+        c.drawString(24*mm, H - 53*mm, f"👤  {reg.attendee.get_full_name() or reg.attendee.email}")
+
+        # Registration ID label
+        c.setFont("Helvetica", 8)
+        c.setFillColorRGB(0.6, 0.6, 0.6)
+        c.drawString(24*mm, H - 65*mm, "ENTRY PASS ID")
+        c.setFont("Helvetica-Bold", 11)
+        c.setFillColorRGB(0.976, 0.451, 0.086)
+        c.drawString(24*mm, H - 74*mm, reg.registration_id)
+
+        # FREE badge
+        c.setFillColorRGB(0.133, 0.773, 0.369)
+        c.roundRect(24*mm, H - 88*mm, 22*mm, 10*mm, 3*mm, fill=1, stroke=0)
+        c.setFillColorRGB(1, 1, 1)
+        c.setFont("Helvetica-Bold", 9)
+        c.drawCentredString(35*mm, H - 84*mm, "FREE")
+
+        # QR code
+        import base64 as b64
+        from reportlab.lib.utils import ImageReader
+        from PIL import Image as PILImage
+        from io import BytesIO as BIO
+
+        qr_bytes = b64.b64decode(qr_b64)
+        qr_img   = PILImage.open(BIO(qr_bytes))
+        qr_buf   = BIO()
+        qr_img.save(qr_buf, format="PNG")
+        qr_buf.seek(0)
+        c.drawImage(ImageReader(qr_buf), W - 51*mm, 8*mm, 44*mm, 44*mm)
+
+        # "Scan to enter" label
+        c.setFont("Helvetica", 7)
+        c.setFillColorRGB(0.6, 0.6, 0.6)
+        c.drawCentredString(W - 29*mm, 5*mm, "SCAN TO ENTER")
+
+        # NFT badge bottom
+        c.setFont("Helvetica", 7)
+        c.setFillColorRGB(0.6, 0.4, 0.9)
+        c.drawString(24*mm, 5*mm, "⛓ NFT-Verified on Polygon Blockchain")
+
+        c.save()
+        buf.seek(0)
+        return base64.b64encode(buf.getvalue()).decode()
+
+    except Exception as e:
+        print(f"PDF generation error: {e}")
+        return None

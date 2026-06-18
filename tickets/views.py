@@ -203,7 +203,7 @@ def purchase_ticket(request):
     static_qr_base64 = generate_static_qr_base64(ticket)
 
     try:
-        async_task('tickets.tasks.task_send_ticket_purchase_email', ticket.pk, static_qr_base64)
+        async_task('tickets.tasks.task_generate_and_send_pdf_ticket', reg.id)
     except Exception as e:
         print(f"Email queue failed: {e}")
 
