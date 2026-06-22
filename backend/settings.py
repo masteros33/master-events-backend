@@ -27,12 +27,16 @@ ALLOWED_HOSTS = os.getenv(
 
 # ── CORS — locked to your domain only ────────────────────────
 CORS_ALLOW_ALL_ORIGINS = False
+
 CORS_ALLOWED_ORIGINS = [
+    "https://masterevents.events",
+    "https://www.masterevents.events",
     "https://master-events-bi7m.vercel.app",
     "https://master-events.vercel.app",
     "http://localhost:5173",
     "http://localhost:3000",
 ]
+
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_HEADERS = [
     "accept",
@@ -282,8 +286,7 @@ LOGGING = {
 PAYSTACK_SECRET_KEY = os.getenv('PAYSTACK_SECRET_KEY', '')
 PAYSTACK_PUBLIC_KEY = os.getenv('PAYSTACK_PUBLIC_KEY', '')
 BACKEND_URL         = os.getenv('BACKEND_URL', 'https://master-events-backend.onrender.com')
-FRONTEND_URL        = os.getenv('FRONTEND_URL', 'https://master-events-bi7m.vercel.app')
-
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'https://masterevents.events')
 # ── Email via Resend ──────────────────────────────────────────
 DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'Master Events <noreply@masterevents.events>')
 RESEND_API_KEY     = os.environ.get('RESEND_API_KEY', '')
