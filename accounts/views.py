@@ -10,7 +10,6 @@ from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.utils import timezone
 from django.conf import settings
 from django_ratelimit.decorators import ratelimit
-from django_q.tasks import async_task
 from .serializers import RegisterSerializer, LoginSerializer, UserSerializer
 from .models import Notification, User
 from django.core.cache import cache
@@ -33,6 +32,64 @@ def rate_limited_response():
     )
 
 
+def _send_verification_email(user):
+    from .models import EmailVerificationToken
+    import resend
+    EmailVerificationToken.objects.filter(user=user).delete()
+    vt        = EmailVerificationToken.objects.create(user=user)
+    token_str = str(vt.token)
+    verify_url = f"{getattr(settings, 'FRONTEND_URL', 'https://masterevents.events')}?verify={token_str}"
+
+    resend.api_key = settings.RESEND_API_KEY
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="UTF-8"></head>
+    <body style="margin:0;padding:0;background:#0f0f0f;font-family:'Helvetica Neue',Arial,sans-serif;">
+        <div style="max-width:600px;margin:0 auto;padding:24px 16px;">
+            <div style="background:linear-gradient(135deg,#F97316,#EA6C0A);border-radius:20px 20px 0 0;padding:32px;text-align:center;">
+                <div style="font-size:32px;margin-bottom:8px;">✉️</div>
+                <h1 style="margin:0;color:#fff;font-size:22px;font-weight:900;">Verify Your Email</h1>
+                <p style="margin:6px 0 0;color:rgba(255,255,255,0.8);font-size:13px;">Master Events Ghana</p>
+            </div>
+            <div style="background:#1a1a1a;padding:32px;border-left:1px solid #2a2a2a;border-right:1px solid #2a2a2a;">
+                <p style="color:rgba(255,255,255,0.75);font-size:15px;line-height:1.8;margin:0 0 24px;">
+                    Hi {user.first_name},<br><br>
+                    Thanks for joining Master Events! Click below to verify your email address.
+                    This link expires in <strong style="color:#F97316;">24 hours</strong>.
+                </p>
+                <div style="text-align:center;margin:28px 0;">
+                    <a href="{verify_url}"
+                       style="background:linear-gradient(135deg,#F97316,#EA6C0A);color:#fff;padding:16px 40px;border-radius:12px;text-decoration:none;font-weight:700;font-size:16px;display:inline-block;">
+                        Verify Email →
+                    </a>
+                </div>
+                <p style="color:rgba(255,255,255,0.35);font-size:12px;text-align:center;">
+                    If you didn't create an account, ignore this email.
+                </p>
+            </div>
+            <div style="background:#111;border-radius:0 0 20px 20px;border:1px solid #2a2a2a;border-top:none;padding:16px;text-align:center;">
+                <p style="color:rgba(255,255,255,0.2);font-size:10px;margin:0;">© 2026 Master Events Ghana</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    resend.Emails.send({
+        "from":    settings.DEFAULT_FROM_EMAIL,
+        "to":      [user.email],
+        "subject": "Master Events — Verify Your Email",
+        "html":    html,
+        "text":    f"Hi {user.first_name},\n\nVerify your email:\n{verify_url}\n\nExpires in 24 hours.",
+    })
+    print(f"✅ Verification email sent to {user.email}")
+
+
+def _bg(fn):
+    """Run fn in a background daemon thread — no worker needed."""
+    threading.Thread(target=fn, daemon=True).start()
+
+
 @api_view(['POST'])
 @permission_classes([AllowAny])
 @ratelimit(key='ip', rate='5/m', method='POST', block=False)
@@ -45,16 +102,26 @@ def register(request):
         user   = serializer.save()
         tokens = get_tokens(user)
 
-        try:
-            async_task('accounts.tasks.task_send_welcome_and_verification', user.pk)
-        except Exception as e:
-            print(f"Welcome email queue failed: {e}")
+        def send_emails():
+            try:
+                from utils.emails import notify_welcome
+                notify_welcome(user)
+                print(f"✅ Welcome email sent to {user.email}")
+            except Exception as e:
+                print(f"❌ Welcome email failed: {e}")
+            try:
+                _send_verification_email(user)
+            except Exception as e:
+                print(f"❌ Verification email failed: {e}")
+
+        _bg(send_emails)
 
         return Response({
             'user':    UserSerializer(user).data,
             'tokens':  tokens,
             'message': 'Account created! Please check your email to verify your account.',
         }, status=status.HTTP_201_CREATED)
+
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
@@ -68,7 +135,6 @@ def login(request):
 
     email = request.data.get('email', '').strip().lower()
 
-    # ── Check lockout ─────────────────────────────────────────
     lockout_key  = f"login_lockout_{email}"
     fail_key     = f"login_fails_{email}"
     locked_until = cache.get(lockout_key)
@@ -87,7 +153,6 @@ def login(request):
         tokens = get_tokens(user)
         return Response({'user': UserSerializer(user).data, 'tokens': tokens})
 
-    # ── Failed login — increment counter ─────────────────────
     fails = cache.get(fail_key, 0) + 1
     cache.set(fail_key, fails, timeout=600)
 
@@ -211,12 +276,17 @@ def forgot_password(request):
 
     token     = default_token_generator.make_token(user)
     uid       = urlsafe_base64_encode(force_bytes(user.pk))
-    reset_url = f"{getattr(settings, 'FRONTEND_URL', 'https://master-events-bi7m.vercel.app')}?uid={uid}&token={token}"
+    reset_url = f"{getattr(settings, 'FRONTEND_URL', 'https://masterevents.events')}?uid={uid}&token={token}"
 
-    try:
-        async_task('accounts.tasks.task_send_password_reset_email', user.pk, reset_url)
-    except Exception as e:
-        print(f"Password reset email queue failed: {e}")
+    def send_reset():
+        try:
+            from utils.emails import notify_password_reset
+            notify_password_reset(user, reset_url)
+            print(f"✅ Password reset email sent to {user.email}")
+        except Exception as e:
+            print(f"❌ Password reset email failed: {e}")
+
+    _bg(send_reset)
 
     return Response({'message': 'Password reset link sent to your email.'})
 
@@ -354,12 +424,11 @@ def test_email(request):
         except Exception as e:
             print(f"❌ Resend error: {e}")
 
-    threading.Thread(target=_send, daemon=True).start()
+    _bg(_send)
     config['status'] = 'dispatched — check Render logs + your inbox in 10 seconds'
     return Response(config)
 
 
-# ── Admin login ───────────────────────────────────────────────
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def admin_login(request):
@@ -461,19 +530,19 @@ def admin_events(request):
     from events.models import Event
     events = Event.objects.select_related('organizer').order_by('-created_at')[:100]
     data = [{
-        'id':             e.id,
-        'name':           e.name,
-        'organizer':      e.organizer.full_name,
-        'organizer_email':e.organizer.email,
-        'date':           str(e.date),
-        'venue':          e.venue,
-        'category':       e.category,
-        'price':          float(e.price),
-        'total_tickets':  e.total_tickets,
-        'tickets_sold':   e.tickets_sold,
-        'sales_open':     e.sales_open,
-        'is_active':      e.is_active,
-        'revenue':        round(float(e.price) * e.tickets_sold * 0.95, 2),
+        'id':              e.id,
+        'name':            e.name,
+        'organizer':       e.organizer.full_name,
+        'organizer_email': e.organizer.email,
+        'date':            str(e.date),
+        'venue':           e.venue,
+        'category':        e.category,
+        'price':           float(e.price),
+        'total_tickets':   e.total_tickets,
+        'tickets_sold':    e.tickets_sold,
+        'sales_open':      e.sales_open,
+        'is_active':       e.is_active,
+        'revenue':         round(float(e.price) * e.tickets_sold * 0.95, 2),
     } for e in events]
     return Response(data)
 
@@ -532,60 +601,6 @@ def admin_toggle_event(request, event_id):
     })
 
 
-# ── Email verification ────────────────────────────────────────
-def _send_verification_email(user):
-    from .models import EmailVerificationToken
-    EmailVerificationToken.objects.filter(user=user).delete()
-    vt        = EmailVerificationToken.objects.create(user=user)
-    token_str = str(vt.token)
-    verify_url = f"{getattr(settings, 'FRONTEND_URL', 'https://master-events-bi7m.vercel.app')}?verify={token_str}"
-
-    import resend
-    resend.api_key = settings.RESEND_API_KEY
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head><meta charset="UTF-8"></head>
-    <body style="margin:0;padding:0;background:#0f0f0f;font-family:'Helvetica Neue',Arial,sans-serif;">
-        <div style="max-width:600px;margin:0 auto;padding:24px 16px;">
-            <div style="background:linear-gradient(135deg,#F97316,#EA6C0A);border-radius:20px 20px 0 0;padding:32px;text-align:center;">
-                <div style="font-size:32px;margin-bottom:8px;">✉️</div>
-                <h1 style="margin:0;color:#fff;font-size:22px;font-weight:900;">Verify Your Email</h1>
-                <p style="margin:6px 0 0;color:rgba(255,255,255,0.8);font-size:13px;">Master Events Ghana</p>
-            </div>
-            <div style="background:#1a1a1a;padding:32px;border-left:1px solid #2a2a2a;border-right:1px solid #2a2a2a;">
-                <p style="color:rgba(255,255,255,0.75);font-size:15px;line-height:1.8;margin:0 0 24px;">
-                    Hi {user.first_name},<br><br>
-                    Thanks for joining Master Events! Click below to verify your email address.
-                    This link expires in <strong style="color:#F97316;">24 hours</strong>.
-                </p>
-                <div style="text-align:center;margin:28px 0;">
-                    <a href="{verify_url}"
-                       style="background:linear-gradient(135deg,#F97316,#EA6C0A);color:#fff;padding:16px 40px;border-radius:12px;text-decoration:none;font-weight:700;font-size:16px;display:inline-block;">
-                        Verify Email →
-                    </a>
-                </div>
-                <p style="color:rgba(255,255,255,0.35);font-size:12px;text-align:center;">
-                    If you didn't create an account, ignore this email.
-                </p>
-            </div>
-            <div style="background:#111;border-radius:0 0 20px 20px;border:1px solid #2a2a2a;border-top:none;padding:16px;text-align:center;">
-                <p style="color:rgba(255,255,255,0.2);font-size:10px;margin:0;">© 2026 Master Events Ghana</p>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    resend.Emails.send({
-        "from":    settings.DEFAULT_FROM_EMAIL,
-        "to":      [user.email],
-        "subject": "Master Events — Verify Your Email",
-        "html":    html,
-        "text":    f"Hi {user.first_name},\n\nVerify your email:\n{verify_url}\n\nExpires in 24 hours.",
-    })
-    print(f"✅ Verification email sent to {user.email}")
-
-
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def verify_email(request):
@@ -636,15 +651,17 @@ def resend_verification(request):
     if user.is_verified:
         return Response({'message': 'This email is already verified.'})
 
-    try:
-        async_task('accounts.tasks.task_send_resend_verification', user.pk)
-    except Exception as e:
-        print(f"Resend verification queue failed: {e}")
+    def resend_ver():
+        try:
+            _send_verification_email(user)
+            print(f"✅ Verification resent to {user.email}")
+        except Exception as e:
+            print(f"❌ Resend verification failed: {e}")
 
+    _bg(resend_ver)
     return Response({'message': 'Verification email sent. Check your inbox.'})
 
 
-# ── Google OAuth ──────────────────────────────────────────────
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def google_auth(request):
@@ -677,12 +694,15 @@ def google_auth(request):
             user.last_name  = last_name
             user.save(update_fields=['first_name', 'last_name'])
 
-        # Send welcome email for new Google users
         if created:
-            try:
-                async_task('accounts.tasks.task_send_welcome_and_verification', user.pk)
-            except Exception as e:
-                print(f"Google welcome email failed: {e}")
+            def send_welcome():
+                try:
+                    from utils.emails import notify_welcome
+                    notify_welcome(user)
+                    print(f"✅ Google welcome email sent to {user.email}")
+                except Exception as e:
+                    print(f"❌ Google welcome email failed: {e}")
+            _bg(send_welcome)
 
         tokens = get_tokens(user)
         return Response({
