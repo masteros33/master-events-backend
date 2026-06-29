@@ -88,4 +88,4 @@ class Event(models.Model):
 
     @property
     def event_url(self):
-        return f"https://{self.slug}.masterevents.com"
+        return f"https://masterevents.events/events/{self.slug}"
