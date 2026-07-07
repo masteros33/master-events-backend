@@ -12,6 +12,13 @@ from .serializers import (
     check_current_owner_hash, generate_static_qr_token,
     generate_qr_base64,
 )
+from .tasks import (
+    task_mint_nft, task_send_ticket_purchase_email, task_send_transfer_email,
+    task_send_resale_notifications, task_send_door_code_email,
+    task_send_ticket_redeemed_notification, task_send_resale_listed_email,
+    task_send_registration_email, task_generate_and_send_pdf_ticket,
+)
+from utils.async_helpers import run_async
 from events.models import Event
 from accounts.models import User
 from payments.models import Wallet, Transaction
@@ -20,7 +27,6 @@ import random
 import string
 import requests
 from django_ratelimit.decorators import ratelimit
-from django_q.tasks import async_task
 import qrcode
 from io import BytesIO
 import base64
@@ -203,14 +209,14 @@ def purchase_ticket(request):
     static_qr_base64 = generate_static_qr_base64(ticket)
 
     try:
-        async_task('tickets.tasks.task_generate_and_send_pdf_ticket', reg.id)
+        run_async(task_send_ticket_purchase_email, ticket.pk, static_qr_base64)
     except Exception as e:
-        print(f"Email queue failed: {e}")
+        print(f"Email send failed: {e}")
 
     try:
-        async_task('tickets.tasks.task_mint_nft', ticket.pk)
+        run_async(task_mint_nft, ticket.pk)
     except Exception as e:
-        print(f"NFT queue failed: {e}")
+        print(f"NFT mint failed: {e}")
 
     ticket_data              = TicketSerializer(ticket, context={'request': request}).data
     ticket_data['qr_base64'] = qr_base64
@@ -282,17 +288,17 @@ def transfer_ticket(request):
 
     new_static_qr_base64 = generate_static_qr_base64(new_ticket)
 
-    # ── Queue transfer email + NFT mint ───────────────────────
+    # ── Send transfer email + mint NFT ────────────────────────
     try:
-        async_task('tickets.tasks.task_send_transfer_email',
+        run_async(task_send_transfer_email,
                    ticket.pk, from_user.pk, to_user.pk, new_ticket.pk, new_static_qr_base64)
     except Exception as e:
-        print(f"Transfer email queue failed: {e}")
+        print(f"Transfer email failed: {e}")
 
     try:
-        async_task('tickets.tasks.task_mint_nft', new_ticket.pk)
+        run_async(task_mint_nft, new_ticket.pk)
     except Exception as e:
-        print(f"NFT transfer queue failed (non-critical): {e}")
+        print(f"NFT transfer mint failed (non-critical): {e}")
 
     return Response({
         'message':    'Ticket transferred successfully',
@@ -462,11 +468,11 @@ def verify_ticket(request):
     else:
         ticket.save(update_fields=['status', 'redeemed_at'])
 
-    # ── Queue redeemed notification ───────────────────────────
+    # ── Send redeemed notification ────────────────────────────
     try:
-        async_task('tickets.tasks.task_send_ticket_redeemed_notification', ticket.pk)
+        run_async(task_send_ticket_redeemed_notification, ticket.pk)
     except Exception as e:
-        print(f"Redeem notification queue failed: {e}")
+        print(f"Redeem notification failed: {e}")
 
     from utils.blockchain import get_polygon_explorer_url
     return Response({
@@ -500,12 +506,11 @@ def generate_door_code(request, event_id):
     code      = 'DOOR-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
     door_code = DoorStaffCode.objects.create(event=event, code=code, created_by=request.user)
 
-    # ── Queue door code email ─────────────────────────────────
+    # ── Send door code email ──────────────────────────────────
     try:
-        async_task('tickets.tasks.task_send_door_code_email',
-                   event.pk, request.user.pk, code)
+        run_async(task_send_door_code_email, event.pk, request.user.pk, code)
     except Exception as e:
-        print(f"Door code email queue failed: {e}")
+        print(f"Door code email failed: {e}")
 
     return Response(DoorStaffCodeSerializer(door_code).data, status=status.HTTP_201_CREATED)
 
@@ -689,15 +694,15 @@ def buy_resale_ticket(request):
     )
 
     try:
-        async_task('tickets.tasks.task_send_resale_notifications',
+        run_async(task_send_resale_notifications,
                    ticket.pk, seller.pk, request.user.pk, float(seller_amount))
     except Exception as e:
-        print(f"Resale notification queue failed: {e}")
+        print(f"Resale notification failed: {e}")
 
     try:
-        async_task('tickets.tasks.task_mint_nft', new_ticket.pk)
+        run_async(task_mint_nft, new_ticket.pk)
     except Exception as e:
-        print(f"Resale NFT queue failed: {e}")
+        print(f"Resale NFT mint failed: {e}")
 
     ticket_data              = TicketSerializer(new_ticket, context={'request': request}).data
     ticket_data['qr_base64'] = qr_base64
@@ -746,12 +751,11 @@ def list_for_resale(request):
     ticket.resale_price = resale_price
     ticket.save(update_fields=['status', 'resale_price'])
 
-    # ── Queue resale listed email ─────────────────────────────
+    # ── Send resale listed email ──────────────────────────────
     try:
-        async_task('tickets.tasks.task_send_resale_listed_email',
-                   ticket.pk, request.user.pk)
+        run_async(task_send_resale_listed_email, ticket.pk, request.user.pk)
     except Exception as e:
-        print(f"Resale listed email queue failed: {e}")
+        print(f"Resale listed email failed: {e}")
 
     return Response({
         'message':      'Ticket listed for resale',
@@ -831,7 +835,6 @@ def register_free_event(request):
 
     # Generate and upload QR
     qr_content = reg.qr_data
-    import qrcode
     qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=4)
     qr.add_data(qr_content)
     qr.make(fit=True)
@@ -860,11 +863,11 @@ def register_free_event(request):
     static_content  = generate_static_qr_token(str(reg.id), reg.event_id, reg.attendee_id)
     static_qr_base64 = generate_qr_base64(static_content)
 
-    # Queue confirmation email
+    # ── Send confirmation email ───────────────────────────────
     try:
-        async_task('tickets.tasks.task_send_registration_email', str(reg.pk), static_qr_base64)
+        run_async(task_send_registration_email, str(reg.pk), static_qr_base64)
     except Exception as e:
-        print(f"Registration email queue failed: {e}")
+        print(f"Registration email failed: {e}")
 
     reg_data = RegistrationSerializer(reg, context={'request': request}).data
     reg_data['qr_base64']        = qr_base64
