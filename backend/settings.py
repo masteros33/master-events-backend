@@ -314,6 +314,9 @@ cloudinary.config(
     api_secret = os.getenv('CLOUDINARY_API_SECRET'),
     secure     = True,
 )
+GOOGLE_CLIENT_ID     = os.getenv('GOOGLE_CLIENT_ID', '')
+GOOGLE_CLIENT_SECRET = os.getenv('GOOGLE_CLIENT_SECRET', '')
+
 
 # ── Django-Q2 Task Queue ──────────────────────────────────────
 Q_CLUSTER = {

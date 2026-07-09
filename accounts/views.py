@@ -15,6 +15,7 @@ from .models import Notification, User
 from django.core.cache import cache
 from datetime import timedelta
 import threading
+import requests as http_requests
 
 
 def get_tokens(user):
@@ -665,6 +666,7 @@ def resend_verification(request):
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def google_auth(request):
+    """Legacy popup-flow handler — kept for desktop, which still works fine."""
     email      = request.data.get('email', '').strip().lower()
     first_name = request.data.get('first_name', '')
     last_name  = request.data.get('last_name', '')
@@ -712,4 +714,95 @@ def google_auth(request):
 
     except Exception as e:
         print(f"Google auth error: {e}")
+        return Response({'error': str(e)}, status=500)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def google_auth_callback(request):
+    """
+    Redirect-flow handler — mobile-safe (no popup/postMessage dependency).
+    Frontend sends the authorization `code` it received from Google's redirect;
+    this exchanges it server-side for tokens using the Client Secret.
+    """
+    code = request.data.get('code', '')
+    role = request.data.get('role', 'attendee')
+
+    if not code:
+        return Response({'error': 'Authorization code required'}, status=400)
+
+    google_client_id     = getattr(settings, 'GOOGLE_CLIENT_ID', '')
+    google_client_secret = getattr(settings, 'GOOGLE_CLIENT_SECRET', '')
+    redirect_uri          = 'https://masterevents.events/auth/callback'
+
+    if not google_client_id or not google_client_secret:
+        return Response({'error': 'Google auth not configured on server'}, status=500)
+
+    try:
+        token_res = http_requests.post('https://oauth2.googleapis.com/token', data={
+            'code':          code,
+            'client_id':     google_client_id,
+            'client_secret': google_client_secret,
+            'redirect_uri':  redirect_uri,
+            'grant_type':    'authorization_code',
+        }, timeout=15)
+        token_data = token_res.json()
+
+        if 'access_token' not in token_data:
+            print(f"❌ Google token exchange failed: {token_data}")
+            return Response({'error': 'Google sign-in failed. Please try again.'}, status=400)
+
+        userinfo_res = http_requests.get(
+            'https://www.googleapis.com/oauth2/v3/userinfo',
+            headers={'Authorization': f"Bearer {token_data['access_token']}"},
+            timeout=15,
+        )
+        info = userinfo_res.json()
+
+    except Exception as e:
+        print(f"❌ Google callback error: {e}")
+        return Response({'error': 'Connection error during Google sign-in'}, status=500)
+
+    email = info.get('email', '').strip().lower()
+    if not email:
+        return Response({'error': 'Could not retrieve email from Google'}, status=400)
+
+    if role not in ['attendee', 'organizer']:
+        role = 'attendee'
+
+    try:
+        user, created = User.objects.get_or_create(
+            email=email,
+            defaults={
+                'first_name':  info.get('given_name', ''),
+                'last_name':   info.get('family_name', ''),
+                'is_verified': True,
+                'role':        role,
+            }
+        )
+
+        if not created and not user.first_name and info.get('given_name'):
+            user.first_name = info.get('given_name', '')
+            user.last_name  = info.get('family_name', '')
+            user.save(update_fields=['first_name', 'last_name'])
+
+        if created:
+            def send_welcome():
+                try:
+                    from utils.emails import notify_welcome
+                    notify_welcome(user)
+                    print(f"✅ Google welcome email sent to {user.email}")
+                except Exception as e:
+                    print(f"❌ Google welcome email failed: {e}")
+            _bg(send_welcome)
+
+        tokens = get_tokens(user)
+        return Response({
+            'user':    UserSerializer(user).data,
+            'tokens':  tokens,
+            'created': created,
+        })
+
+    except Exception as e:
+        print(f"Google callback user error: {e}")
         return Response({'error': str(e)}, status=500)
