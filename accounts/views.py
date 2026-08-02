@@ -727,13 +727,13 @@ def google_auth_callback(request):
     """
     code = request.data.get('code', '')
     role = request.data.get('role', 'attendee')
+    redirect_uri = request.data.get('redirect_uri', '') or 'https://masterevents.events/auth/callback'
 
     if not code:
         return Response({'error': 'Authorization code required'}, status=400)
 
     google_client_id     = getattr(settings, 'GOOGLE_CLIENT_ID', '')
     google_client_secret = getattr(settings, 'GOOGLE_CLIENT_SECRET', '')
-    redirect_uri          = 'https://masterevents.events/auth/callback'
 
     if not google_client_id or not google_client_secret:
         return Response({'error': 'Google auth not configured on server'}, status=500)
