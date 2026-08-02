@@ -35,6 +35,7 @@ CORS_ALLOWED_ORIGINS = [
     "https://master-events.vercel.app",
     "http://localhost:5173",
     "http://localhost:3000",
+    "http://localhost:3001",   # ← add this
 ]
 
 CORS_ALLOW_CREDENTIALS = True
