@@ -14,6 +14,11 @@ except Exception as e:
     print(f"Blockchain connection error: {e}")
     w3 = None
 
+# ── Lock: serializes nonce-fetch → send for ALL wallet transactions
+# (minting AND transfers use the same wallet — both must share this lock
+# or they can still race each other even if minting alone is serialized) ──
+_mint_lock = threading.Lock()
+
 NFT_ABI = [
     {
         "inputs": [
@@ -150,7 +155,8 @@ def _parse_token_id_from_receipt(receipt, contract):
 def mint_ticket_nft(ticket, owner_wallet_address=None, max_retries=3):
     """
     Mint NFT sequentially on Polygon Amoy Testnet.
-    Fixed: always fetches fresh nonce, higher gas price multiplier.
+    Nonce-fetch through send is wrapped in _mint_lock so concurrent
+    mints (or a mint racing a transfer) can't grab the same nonce.
     """
     if not is_blockchain_enabled():
         print("Blockchain not configured — skipping NFT mint")
@@ -174,31 +180,32 @@ def mint_ticket_nft(ticket, owner_wallet_address=None, max_retries=3):
 
             print(f"[Attempt {attempt}/{max_retries}] Minting NFT to {to_address}...")
 
-            nonce     = w3.eth.get_transaction_count(platform_address, 'pending')
-            gas_price = int(w3.eth.gas_price * 1.5)
+            with _mint_lock:
+                nonce     = w3.eth.get_transaction_count(platform_address, 'pending')
+                gas_price = int(w3.eth.gas_price * 1.5)
 
-            try:
-                estimated_gas = contract.functions.mintTicket(
-                    to_address, token_uri
-                ).estimate_gas({'from': platform_address})
-                gas_limit = int(estimated_gas * 1.3)
-            except Exception:
-                gas_limit = 300000
+                try:
+                    estimated_gas = contract.functions.mintTicket(
+                        to_address, token_uri
+                    ).estimate_gas({'from': platform_address})
+                    gas_limit = int(estimated_gas * 1.3)
+                except Exception:
+                    gas_limit = 300000
 
-            txn = contract.functions.mintTicket(
-                to_address,
-                token_uri
-            ).build_transaction({
-                'from':     platform_address,
-                'nonce':    nonce,
-                'gas':      gas_limit,
-                'gasPrice': gas_price,
-                'chainId':  80002,
-            })
+                txn = contract.functions.mintTicket(
+                    to_address,
+                    token_uri
+                ).build_transaction({
+                    'from':     platform_address,
+                    'nonce':    nonce,
+                    'gas':      gas_limit,
+                    'gasPrice': gas_price,
+                    'chainId':  80002,
+                })
 
-            signed_txn = w3.eth.account.sign_transaction(txn, settings.BLOCKCHAIN_PRIVATE_KEY)
-            tx_hash    = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
-            print(f"TX sent: {tx_hash.hex()}")
+                signed_txn = w3.eth.account.sign_transaction(txn, settings.BLOCKCHAIN_PRIVATE_KEY)
+                tx_hash    = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+                print(f"TX sent: {tx_hash.hex()}")
 
             receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
 
@@ -296,45 +303,80 @@ def retry_failed_mints():
         print(f"retry_failed_mints error: {e}")
 
 
+def mark_stale_mints_as_failed(stale_minutes=10):
+    """
+    Catches tickets whose minting thread died silently — e.g. Render
+    recycled the web process mid-mint, killing the daemon thread with
+    no exception and no log. Without this, such tickets stay stuck
+    'minting' forever, since nothing else ever flags them for retry.
+    """
+    from django.utils import timezone
+    from datetime import timedelta
+    from tickets.models import Ticket as TicketModel
+
+    cutoff = timezone.now() - timedelta(minutes=stale_minutes)
+    count = TicketModel.objects.filter(
+        nft_tx_hash__isnull=True,
+        nft_mint_failed=False,
+        status__in=['active', 'resale'],
+        created_at__lt=cutoff,
+    ).update(nft_mint_failed=True)
+    if count:
+        print(f"⚠️ Marked {count} stale ticket(s) as mint_failed for retry")
+    return count
+
+
+def run_mint_maintenance():
+    """
+    Call this on a schedule (e.g. every 5 min via a free external cron
+    hitting a protected endpoint) to catch and retry stuck mints without
+    needing a paid Render worker dyno.
+    """
+    mark_stale_mints_as_failed()
+    retry_failed_mints()
+
+
 def transfer_ticket_nft(token_id, from_wallet, to_wallet):
     if not is_blockchain_enabled():
         return None
     try:
-        contract         = get_contract()
+        contract = get_contract()
         if not contract:
             return None
 
         platform_account = w3.eth.account.from_key(settings.BLOCKCHAIN_PRIVATE_KEY)
         platform_address = platform_account.address
 
-        nonce     = w3.eth.get_transaction_count(platform_address, 'pending')
-        gas_price = int(w3.eth.gas_price * 1.5)
+        with _mint_lock:
+            nonce     = w3.eth.get_transaction_count(platform_address, 'pending')
+            gas_price = int(w3.eth.gas_price * 1.5)
 
-        try:
-            estimated_gas = contract.functions.transferFrom(
+            try:
+                estimated_gas = contract.functions.transferFrom(
+                    Web3.to_checksum_address(from_wallet),
+                    Web3.to_checksum_address(to_wallet),
+                    token_id
+                ).estimate_gas({'from': platform_address})
+                gas_limit = int(estimated_gas * 1.3)
+            except Exception:
+                gas_limit = 200000
+
+            txn = contract.functions.transferFrom(
                 Web3.to_checksum_address(from_wallet),
                 Web3.to_checksum_address(to_wallet),
                 token_id
-            ).estimate_gas({'from': platform_address})
-            gas_limit = int(estimated_gas * 1.3)
-        except Exception:
-            gas_limit = 200000
+            ).build_transaction({
+                'from':     platform_address,
+                'nonce':    nonce,
+                'gas':      gas_limit,
+                'gasPrice': gas_price,
+                'chainId':  80002,
+            })
 
-        txn = contract.functions.transferFrom(
-            Web3.to_checksum_address(from_wallet),
-            Web3.to_checksum_address(to_wallet),
-            token_id
-        ).build_transaction({
-            'from':     platform_address,
-            'nonce':    nonce,
-            'gas':      gas_limit,
-            'gasPrice': gas_price,
-            'chainId':  80002,
-        })
+            signed_txn = w3.eth.account.sign_transaction(txn, settings.BLOCKCHAIN_PRIVATE_KEY)
+            tx_hash    = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
 
-        signed_txn = w3.eth.account.sign_transaction(txn, settings.BLOCKCHAIN_PRIVATE_KEY)
-        tx_hash    = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
-        receipt    = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
 
         if receipt.status == 1:
             tx_hash_hex = tx_hash.hex()

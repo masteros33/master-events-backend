@@ -874,3 +874,26 @@ def register_free_event(request):
     reg_data['static_qr_base64'] = static_qr_base64
     reg_data['message']          = f'Registered for {event.name}! Check your email for your entry pass.'
     return Response(reg_data, status=201)
+
+
+# ── Mint maintenance — catches stuck/failed mints without a paid worker ──
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def run_mint_maintenance_endpoint(request):
+    """
+    Ping this from a free external cron (e.g. cron-job.org) every 5
+    minutes with header X-Maintenance-Secret set to MAINTENANCE_SECRET.
+    Catches mints whose thread died silently on a Render restart, and
+    retries any tickets already flagged nft_mint_failed=True.
+    """
+    secret = request.headers.get('X-Maintenance-Secret', '')
+    if not secret or secret != getattr(settings, 'MAINTENANCE_SECRET', ''):
+        return Response({'error': 'Unauthorized'}, status=403)
+
+    from utils.blockchain import run_mint_maintenance
+    try:
+        run_mint_maintenance()
+        return Response({'status': 'ok'})
+    except Exception as e:
+        print(f"❌ run_mint_maintenance_endpoint error: {e}")
+        return Response({'error': 'Maintenance run failed'}, status=500)

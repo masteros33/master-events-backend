@@ -16,4 +16,5 @@ urlpatterns = [
     path('resale/list/',                          views.list_for_resale,    name='list-for-resale'),
     path('resale/cancel/',                        views.cancel_resale,      name='cancel-resale'),
     path('register-free/',                        views.register_free_event, name='register-free-event'),
+    path('maintenance/run-mints/',                views.run_mint_maintenance_endpoint, name='run-mint-maintenance'),
 ]

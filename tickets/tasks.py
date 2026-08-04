@@ -296,7 +296,7 @@ def _generate_ticket_pdf(reg, qr_b64):
 
         # "Scan to enter" label
         c.setFont("Helvetica", 7)
-        c.setFillColorRGB(0.6, 0.6, 0.6)
+        c.setFillColorRGB(0.6, 0.6,0.6)
         c.drawCentredString(W - 29*mm, 5*mm, "SCAN TO ENTER")
 
         # NFT badge bottom
@@ -310,4 +310,4 @@ def _generate_ticket_pdf(reg, qr_b64):
 
     except Exception as e:
         print(f"PDF generation error: {e}")
-        return None
+        return Nonebe
