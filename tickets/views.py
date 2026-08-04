@@ -5,6 +5,7 @@ from rest_framework.response import Response
 from django.utils import timezone
 from django.conf import settings
 from .models import Ticket, DoorStaffCode, TicketTransfer
+from events.models import TicketTier
 from .serializers import (
     TicketSerializer, PurchaseSerializer, TransferSerializer,
     VerifyTicketSerializer, DoorStaffCodeSerializer,
@@ -137,10 +138,8 @@ def purchase_ticket(request):
     if not serializer.is_valid():
         return Response(serializer.errors, status=400)
 
-    data = serializer.validated_data
-
-    total         = None
-    total_pesewas = None
+    data    = serializer.validated_data
+    tier_id = request.data.get('tier_id')  # optional — present only for tiered events
 
     # ── Verify payment first (outside lock) ───────────────────
     try:
@@ -148,7 +147,16 @@ def purchase_ticket(request):
     except Event.DoesNotExist:
         return Response({'error': 'Event not found or sales closed'}, status=404)
 
-    total         = Decimal(str(float(event.price) * data['quantity']))
+    tier = None
+    unit_price = event.price
+    if tier_id:
+        try:
+            tier = TicketTier.objects.get(pk=tier_id, event=event)
+        except TicketTier.DoesNotExist:
+            return Response({'error': 'Selected ticket tier not found'}, status=404)
+        unit_price = tier.price
+
+    total         = Decimal(str(float(unit_price) * data['quantity']))
     total_pesewas = int(total * 100)
     payment_ref   = data['payment_reference']
 
@@ -158,17 +166,26 @@ def purchase_ticket(request):
     if Ticket.objects.filter(payment_reference=payment_ref).exists():
         return Response({'error': 'Payment reference already used.'}, status=409)
 
-    # ── Atomic lock — prevent overselling ────────────────────
+    # ── Atomic lock — prevent overselling (event AND tier capacity) ──
     try:
         with transaction.atomic():
             event = Event.objects.select_for_update().get(
                 pk=data['event_id'], is_active=True, sales_open=True
             )
-            if event.tickets_remaining < data['quantity']:
-                return Response({'error': 'Not enough tickets available'}, status=400)
+
+            if tier:
+                tier = TicketTier.objects.select_for_update().get(pk=tier.pk)
+                if tier.remaining < data['quantity']:
+                    return Response({'error': f'Not enough {tier.name} tickets available'}, status=400)
+                tier.sold += data['quantity']
+                tier.save(update_fields=['sold'])
+            else:
+                if event.tickets_remaining < data['quantity']:
+                    return Response({'error': 'Not enough tickets available'}, status=400)
 
             ticket = Ticket(
                 event=event,
+                tier=tier,
                 owner=request.user,
                 original_buyer=request.user,
                 quantity=data['quantity'],
@@ -191,7 +208,7 @@ def purchase_ticket(request):
                 wallet=organizer_wallet,
                 type='sale',
                 amount=organizer_amount,
-                description=f"{data['quantity']}x {event.name}",
+                description=f"{data['quantity']}x {tier.name + ' — ' if tier else ''}{event.name}",
                 reference=payment_ref,
                 status='completed',
             )
@@ -272,6 +289,7 @@ def transfer_ticket(request):
 
     new_ticket = Ticket(
         event=ticket.event,
+        tier=ticket.tier,
         owner=to_user,
         original_buyer=ticket.original_buyer,
         quantity=ticket.quantity,
@@ -660,6 +678,7 @@ def buy_resale_ticket(request):
 
     new_ticket = Ticket(
         event=ticket.event,
+        tier=ticket.tier,
         owner=request.user,
         original_buyer=ticket.original_buyer,
         quantity=ticket.quantity,

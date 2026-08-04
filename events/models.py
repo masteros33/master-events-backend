@@ -89,3 +89,34 @@ class Event(models.Model):
     @property
     def event_url(self):
         return f"https://masterevents.events/events/{self.slug}"
+
+
+class TicketTier(models.Model):
+    """
+    Optional per-event ticket tiers (Regular/VIP/VVIP/custom).
+    An event with no tiers still works exactly as before, using its
+    own price/total_tickets — tiers are purely additive, never required.
+    """
+    event    = models.ForeignKey(Event, on_delete=models.CASCADE, related_name='tiers')
+    name     = models.CharField(max_length=100)
+    price    = models.DecimalField(max_digits=10, decimal_places=2)
+    capacity = models.IntegerField()
+    sold     = models.IntegerField(default=0)
+    order    = models.IntegerField(default=0)  # display order: Regular, VIP, VVIP...
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'ticket_tiers'
+        ordering = ['order', 'price']
+
+    def __str__(self):
+        return f"{self.name} — {self.event.name}"
+
+    @property
+    def remaining(self):
+        return self.capacity - self.sold
+
+    @property
+    def is_sold_out(self):
+        return self.sold >= self.capacity

@@ -15,6 +15,14 @@ class Ticket(models.Model):
     id              = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     ticket_id       = models.CharField(max_length=50, unique=True)
     event           = models.ForeignKey(Event, on_delete=models.CASCADE, related_name='tickets')
+
+    # ── NEW: which tier this ticket belongs to, if the event uses tiers.
+    # Nullable so every existing ticket (pre-tiers) stays valid untouched.
+    tier            = models.ForeignKey(
+        'events.TicketTier', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='tickets'
+    )
+
     owner           = models.ForeignKey(User, on_delete=models.CASCADE, related_name='tickets')
     original_buyer  = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='purchased_tickets')
     quantity        = models.IntegerField(default=1)
