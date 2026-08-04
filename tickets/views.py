@@ -883,8 +883,13 @@ def run_mint_maintenance_endpoint(request):
     """
     Ping this from a free external cron (e.g. cron-job.org) every 5
     minutes with header X-Maintenance-Secret set to MAINTENANCE_SECRET.
-    Catches mints whose thread died silently on a Render restart, and
-    retries any tickets already flagged nft_mint_failed=True.
+
+    Fires the maintenance sweep (stale-mint detection + sequential
+    retry of failed mints) in a background thread and returns
+    immediately. Running the sweep inline blocked the request long
+    enough — retrying many tickets sequentially with 2s sleeps between
+    each — that Render's gunicorn worker got SIGKILLed as an apparent
+    OOM/timeout, which is what produced the 500 before this fix.
     """
     secret = request.headers.get('X-Maintenance-Secret', '')
     if not secret or secret != getattr(settings, 'MAINTENANCE_SECRET', ''):
@@ -892,8 +897,8 @@ def run_mint_maintenance_endpoint(request):
 
     from utils.blockchain import run_mint_maintenance
     try:
-        run_mint_maintenance()
-        return Response({'status': 'ok'})
+        run_async(run_mint_maintenance)
+        return Response({'status': 'started'})
     except Exception as e:
         print(f"❌ run_mint_maintenance_endpoint error: {e}")
-        return Response({'error': 'Maintenance run failed'}, status=500)
+        return Response({'error': 'Could not start maintenance run'}, status=500)
