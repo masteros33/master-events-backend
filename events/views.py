@@ -138,7 +138,23 @@ def event_create(request):
     data = {}
     for key in request.data:
         val = request.data[key]
-        data[key] = val[0] if isinstance(val, list) else val
+        # ── FIX: this loop exists to unwrap QueryDict's list-wrapping
+        # for multipart/form-data submissions (e.g. currency arrives as
+        # ['GHS'], and val[0] correctly restores 'GHS'). But for JSON
+        # requests, ticket_tiers is a GENUINE list of tier objects —
+        # e.g. [{"name": "Regular", ...}, {"name": "VIP", ...}] — and
+        # this same unwrap logic was silently truncating it down to
+        # just val[0], the first tier dict, discarding every other
+        # tier and handing EventCreateSerializer a single dict where
+        # it expected a list. That's the exact source of the
+        # "Expected a list of items but got type dict" error. Skip the
+        # unwrap specifically for ticket_tiers so the real array passes
+        # through untouched; every other field still gets the
+        # multipart-safe unwrap as before.
+        if key == 'ticket_tiers':
+            data[key] = val
+        else:
+            data[key] = val[0] if isinstance(val, list) else val
 
     image_file = request.FILES.get('image')
     image_val  = data.get('image', '')
@@ -177,7 +193,17 @@ def event_update(request, pk):
     data = {}
     for key in request.data:
         val = request.data[key]
-        data[key] = val[0] if isinstance(val, list) else val
+        # ── FIX: same guard as event_create — ticket_tiers must not be
+        # unwrapped to its first element. Not currently used for tier
+        # edits (create() vs update() handle tiers differently — see
+        # EventCreateSerializer.update, which pops and ignores
+        # ticket_tiers entirely), but kept consistent here so this
+        # loop can never reintroduce the same bug if tier editing is
+        # wired up through this endpoint later.
+        if key == 'ticket_tiers':
+            data[key] = val
+        else:
+            data[key] = val[0] if isinstance(val, list) else val
 
     image_file = request.FILES.get('image')
     image_val  = data.get('image', '')
