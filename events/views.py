@@ -37,7 +37,12 @@ def event_list(request):
     search     = request.query_params.get('search')
     event_type = request.query_params.get('event_type')
     currency   = request.query_params.get('currency')
-    events     = Event.objects.filter(is_active=True, sales_open=True)
+    # ── FIX: is_approved=True added — this is the core gate. An event
+    # that hasn't been reviewed by an admin will never appear here,
+    # regardless of is_active/sales_open state. Organizers still see
+    # it via my_events (unfiltered) so they know it's pending, not
+    # broken. ──
+    events     = Event.objects.filter(is_active=True, sales_open=True, is_approved=True)
     if city:       events = events.filter(city__icontains=city)
     if category:   events = events.filter(category=category)
     if search:     events = events.filter(name__icontains=search)
@@ -51,25 +56,30 @@ def event_list(request):
 @permission_classes([AllowAny])
 def event_detail(request, pk):
     try:
-        event = Event.objects.get(pk=pk, is_active=True)
+        # ── FIX: same gate applied here — a direct-ID lookup of an
+        # unapproved event should 404 for the public, same as if it
+        # didn't exist. Prevents guessing IDs to bypass the list filter.
+        event = Event.objects.get(pk=pk, is_active=True, is_approved=True)
     except Event.DoesNotExist:
         return Response({'error': 'Event not found'}, status=404)
     return Response(EventSerializer(event).data)
 
 
-# ── NEW: Public event landing page by slug ────────────────────
-# This powers tgma.masterevents.events → /api/events/slug/tgma/
+# ── Public event landing page by slug ──────────────────────────
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def event_by_slug(request, slug):
     try:
-        event = Event.objects.get(slug=slug, is_active=True)
+        # ── FIX: same gate — the shareable slug link (masterevents.events/events/xyz)
+        # must not work for an unapproved event either, otherwise the
+        # approval gate is trivially bypassed by just sharing the direct link.
+        event = Event.objects.get(slug=slug, is_active=True, is_approved=True)
     except Event.DoesNotExist:
         return Response({'error': 'Event not found'}, status=404)
     return Response(PublicEventSerializer(event).data)
 
 
-# ── NEW: Organizer event attendees/registrations ──────────────
+# ── Organizer event attendees/registrations ─────────────────────
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def event_attendees(request, pk):
@@ -81,7 +91,6 @@ def event_attendees(request, pk):
 
     from tickets.models import Ticket, Registration
 
-    # Paid ticket holders
     tickets = Ticket.objects.filter(
         event=event
     ).exclude(status='transferred').select_related('owner')
@@ -98,7 +107,6 @@ def event_attendees(request, pk):
         'redeemed':    t.status == 'redeemed',
     } for t in tickets]
 
-    # Free registrations
     registrations = Registration.objects.filter(
         event=event
     ).select_related('attendee')
@@ -138,19 +146,6 @@ def event_create(request):
     data = {}
     for key in request.data:
         val = request.data[key]
-        # ── FIX: this loop exists to unwrap QueryDict's list-wrapping
-        # for multipart/form-data submissions (e.g. currency arrives as
-        # ['GHS'], and val[0] correctly restores 'GHS'). But for JSON
-        # requests, ticket_tiers is a GENUINE list of tier objects —
-        # e.g. [{"name": "Regular", ...}, {"name": "VIP", ...}] — and
-        # this same unwrap logic was silently truncating it down to
-        # just val[0], the first tier dict, discarding every other
-        # tier and handing EventCreateSerializer a single dict where
-        # it expected a list. That's the exact source of the
-        # "Expected a list of items but got type dict" error. Skip the
-        # unwrap specifically for ticket_tiers so the real array passes
-        # through untouched; every other field still gets the
-        # multipart-safe unwrap as before.
         if key == 'ticket_tiers':
             data[key] = val
         else:
@@ -172,8 +167,11 @@ def event_create(request):
 
     serializer = EventCreateSerializer(data=data, context={'request': request})
     if serializer.is_valid():
+        # is_approved is not writable through this serializer (see
+        # EventCreateSerializer) — every new event lands here at the
+        # model default of False, i.e. pending review.
         event = serializer.save()
-        print(f"✅ Event created: {event.name} (id={event.id}, slug={event.slug}, type={event.event_type})")
+        print(f"✅ Event created (PENDING REVIEW): {event.name} (id={event.id}, slug={event.slug}, type={event.event_type})")
         return Response(EventSerializer(event).data, status=201)
 
     print(f"❌ Event create validation errors: {serializer.errors}")
@@ -193,13 +191,6 @@ def event_update(request, pk):
     data = {}
     for key in request.data:
         val = request.data[key]
-        # ── FIX: same guard as event_create — ticket_tiers must not be
-        # unwrapped to its first element. Not currently used for tier
-        # edits (create() vs update() handle tiers differently — see
-        # EventCreateSerializer.update, which pops and ignores
-        # ticket_tiers entirely), but kept consistent here so this
-        # loop can never reintroduce the same bug if tier editing is
-        # wired up through this endpoint later.
         if key == 'ticket_tiers':
             data[key] = val
         else:
@@ -245,6 +236,10 @@ def event_delete(request, pk):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def my_events(request):
+    """Organizer's own event list — deliberately NOT filtered by
+    is_approved, so organizers can see and manage their pending events
+    (EventSerializer includes is_approved so the frontend can show a
+    'Pending Review' badge)."""
     if request.user.role != 'organizer':
         return Response({'error': 'Only organizers can view this'}, status=403)
     events = Event.objects.filter(organizer=request.user, is_active=True)

@@ -36,7 +36,6 @@ class Event(models.Model):
     date          = models.DateField()
     time          = models.TimeField()
 
-    # ── NEW: event type + currency ─────────────────────────────
     event_type    = models.CharField(max_length=10, choices=EVENT_TYPE_CHOICES, default='paid')
     currency      = models.CharField(max_length=3, choices=CURRENCY_CHOICES, default='GHS')
 
@@ -47,7 +46,16 @@ class Event(models.Model):
     sales_open    = models.BooleanField(default=True)
     is_active     = models.BooleanField(default=True)
 
-    # ── NEW: custom subdomain slug, e.g. "tgma" → tgma.masterevents.com ──
+    # ── NEW: admin approval gate. Every event starts unapproved and is
+    # invisible on public discovery (event_list) until a super admin
+    # reviews and approves it. This is the core fix against the scam
+    # scenario — an organizer creating a fake event, selling tickets,
+    # and disappearing before the event date. Organizers still see
+    # their own pending events immediately via my_events (unfiltered),
+    # so the create flow doesn't feel broken — they just see a
+    # "Pending Review" state instead of "Live". ──
+    is_approved   = models.BooleanField(default=False)
+
     slug          = models.SlugField(max_length=60, unique=True, blank=True)
 
     created_at    = models.DateTimeField(auto_now_add=True)
@@ -69,7 +77,6 @@ class Event(models.Model):
                 slug = f"{base}-{i}"
                 i += 1
             self.slug = slug
-        # Free events always have price = 0
         if self.event_type == 'free':
             self.price = 0
         super().save(*args, **kwargs)
@@ -102,7 +109,7 @@ class TicketTier(models.Model):
     price    = models.DecimalField(max_digits=10, decimal_places=2)
     capacity = models.IntegerField()
     sold     = models.IntegerField(default=0)
-    order    = models.IntegerField(default=0)  # display order: Regular, VIP, VVIP...
+    order    = models.IntegerField(default=0)
 
     created_at = models.DateTimeField(auto_now_add=True)
 

@@ -156,10 +156,6 @@ def task_retry_failed_mints():
         raise
 
 
-
-
-
-
 def task_send_registration_email(registration_id, static_qr_base64=None):
     """Send free event registration confirmation email"""
     try:
@@ -171,13 +167,6 @@ def task_send_registration_email(registration_id, static_qr_base64=None):
     except Exception as e:
         print(f"❌ [Q] task_send_registration_email error: {e}")
         raise
-
-
-
-
-
-
-
 
 
 def task_generate_and_send_pdf_ticket(registration_id):
@@ -310,4 +299,4 @@ def _generate_ticket_pdf(reg, qr_b64):
 
     except Exception as e:
         print(f"PDF generation error: {e}")
-        return Nonebe
+        return None

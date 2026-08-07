@@ -14,6 +14,9 @@ class TicketTierSerializer(serializers.ModelSerializer):
 
 
 class EventSerializer(serializers.ModelSerializer):
+    """Organizer/authenticated-facing serializer — includes is_approved
+    so organizers can see their event's review status on their own
+    dashboard (my_events uses this, unfiltered by approval state)."""
     organizer         = UserSerializer(read_only=True)
     tickets_remaining = serializers.ReadOnlyField()
     is_sold_out       = serializers.ReadOnlyField()
@@ -30,11 +33,12 @@ class EventSerializer(serializers.ModelSerializer):
             'event_type', 'currency', 'price',
             'total_tickets', 'tickets_sold', 'tickets_remaining',
             'is_sold_out', 'image', 'sales_open', 'is_active',
+            'is_approved',
             'revenue', 'slug', 'event_url',
             'registrations_count', 'created_at',
             'tiers',
         ]
-        read_only_fields = ['tickets_sold', 'organizer', 'slug']
+        read_only_fields = ['tickets_sold', 'organizer', 'slug', 'is_approved']
 
     def get_registrations_count(self, obj):
         try:
@@ -61,12 +65,14 @@ class EventCreateSerializer(serializers.ModelSerializer):
             'total_tickets', 'image', 'sales_open',
             'ticket_tiers',
         ]
+        # ── is_approved deliberately NOT in fields — an organizer can
+        # never set their own approval status through this serializer,
+        # regardless of what's in the request payload. New events
+        # always start at the model default (False). ──
 
     def validate(self, data):
-        # Free events must have price 0
         if data.get('event_type') == 'free':
             data['price'] = 0
-        # Paid events must have price > 0
         if data.get('event_type') == 'paid':
             if not data.get('price') or float(data.get('price', 0)) <= 0:
                 raise serializers.ValidationError({'price': 'Paid events must have a price greater than 0.'})
@@ -89,16 +95,13 @@ class EventCreateSerializer(serializers.ModelSerializer):
                     capacity=t.get('capacity', 0),
                     order=i,
                 )
-            # keep event.total_tickets consistent with the sum of tier
-            # capacities, so non-tier-aware code paths (dashboards, CSV
-            # export, etc.) still show correct totals
             event.total_tickets = sum(int(t.get('capacity', 0)) for t in tiers_data)
             event.save(update_fields=['total_tickets'])
 
         return event
 
     def update(self, instance, validated_data):
-        validated_data.pop('ticket_tiers', None)  # tier edits handled separately, not here
+        validated_data.pop('ticket_tiers', None)
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()
@@ -106,7 +109,12 @@ class EventCreateSerializer(serializers.ModelSerializer):
 
 
 class PublicEventSerializer(serializers.ModelSerializer):
-    """Lightweight serializer for public event landing pages — no revenue/organizer details"""
+    """Lightweight serializer for public event landing pages — no
+    revenue/organizer details, and deliberately no is_approved either:
+    a public visitor never needs to know an event's review status, and
+    they'll only ever reach this serializer for an event that's
+    already been approved anyway, since event_by_slug/event_list
+    filter on it before this serializer ever runs."""
     tickets_remaining   = serializers.ReadOnlyField()
     is_sold_out         = serializers.ReadOnlyField()
     registrations_count = serializers.SerializerMethodField()

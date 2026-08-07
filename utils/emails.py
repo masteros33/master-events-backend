@@ -3,8 +3,33 @@ import threading
 from django.conf import settings
 from accounts.models import Notification
 
+# ═══════════════════════════════════════════════════════════════
+#  DESIGN SYSTEM — shared components so every email looks
+#  consistent. Colors match the brand orange used across the app.
+# ═══════════════════════════════════════════════════════════════
 
-def _send_email_async(to_email, subject, html, text):
+BRAND_GRADIENT = "linear-gradient(135deg,#f5a623,#e8920f)"
+BG_OUTER  = "#0a0a0c"
+BG_PANEL  = "#141416"
+BG_CARD   = "#0f0f11"
+BORDER    = "rgba(245,166,35,0.15)"
+FONT      = "'Helvetica Neue',Arial,sans-serif"
+
+PILL_COLORS = {
+    "green":  ("#22c55e", "rgba(34,197,94,0.12)",  "#22c55e"),
+    "orange": ("#f5a623", "rgba(245,166,35,0.12)", "#f5a623"),
+    "red":    ("#ef4444", "rgba(239,68,68,0.12)",  "#ef4444"),
+}
+NOTICE_COLORS = {
+    "orange": ("rgba(245,166,35,0.06)", "rgba(245,166,35,0.18)", "#f5a623"),
+    "purple": ("rgba(124,58,237,0.06)", "rgba(124,58,237,0.18)", "#a78bfa"),
+    "green":  ("rgba(34,197,94,0.06)",  "rgba(34,197,94,0.18)",  "#4ade80"),
+    "amber":  ("rgba(251,191,36,0.08)", "rgba(251,191,36,0.2)",  "#fbbf24"),
+    "red":    ("rgba(239,68,68,0.06)",  "rgba(239,68,68,0.18)",  "#f87171"),
+}
+
+
+def _send_email_async(to_email, subject, html, text, attachments=None):
     def _send():
         try:
             resend.api_key = settings.RESEND_API_KEY
@@ -15,6 +40,8 @@ def _send_email_async(to_email, subject, html, text):
                 "html":    html,
                 "text":    text,
             }
+            if attachments:
+                params["attachments"] = attachments
             r = resend.Emails.send(params)
             print(f"✅ Email sent via Resend: {r}")
         except Exception as e:
@@ -22,46 +49,141 @@ def _send_email_async(to_email, subject, html, text):
     threading.Thread(target=_send, daemon=True).start()
 
 
-def _build_html(title, body, action_url=None, action_label="View Ticket →", icon="🎟️"):
-    action_button = ""
-    if action_url:
-        action_button = f"""
-        <div style="text-align:center;margin:24px 0;">
-            <a href="{action_url}"
-               style="background:linear-gradient(135deg,#f5a623,#e8920f);color:#fff;padding:14px 32px;border-radius:12px;text-decoration:none;font-weight:700;font-size:15px;display:inline-block;">
-                {action_label}
-            </a>
-        </div>
-        """
+def _upload_base64_qr(base64_str, public_id):
+    """
+    Upload a base64 QR image to Cloudinary and return a real hosted
+    URL. Data-URI images (data:image/png;base64,...) are silently
+    stripped by many mail clients — this is what caused blank QR
+    boxes in delivered emails. A hosted https:// URL renders
+    reliably everywhere. Falls back to the base64 data URI only if
+    the upload itself fails, so nothing regresses if Cloudinary is
+    briefly unavailable.
+    """
+    if not base64_str:
+        return None
+    try:
+        import cloudinary.uploader
+        result = cloudinary.uploader.upload(
+            f"data:image/png;base64,{base64_str}",
+            folder="master_events/qr_codes",
+            public_id=public_id,
+            resource_type="image",
+            overwrite=True,
+        )
+        return result.get('secure_url')
+    except Exception as e:
+        print(f"⚠️ QR Cloudinary upload failed, falling back to inline: {e}")
+        return f"data:image/png;base64,{base64_str}"
+
+
+# ── Shared components ───────────────────────────────────────
+
+def _shell(inner_html):
     return f"""
     <!DOCTYPE html>
     <html>
     <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
-    <body style="margin:0;padding:0;background:#0f0f0f;font-family:'Helvetica Neue',Arial,sans-serif;">
-        <div style="max-width:600px;margin:0 auto;padding:24px 16px;">
-            <div style="background:linear-gradient(135deg,#f5a623,#e8920f);border-radius:20px 20px 0 0;padding:32px;text-align:center;">
-                <div style="font-size:32px;margin-bottom:8px;">{icon}</div>
-                <h1 style="margin:0;color:#fff;font-size:24px;font-weight:900;letter-spacing:-0.5px;">Master Events</h1>
-                <p style="margin:6px 0 0;color:rgba(255,255,255,0.8);font-size:12px;letter-spacing:2px;text-transform:uppercase;">NFT-Powered Event Ticketing</p>
-            </div>
-            <div style="background:#1a1a1a;padding:32px;border-left:1px solid #2a2a2a;border-right:1px solid #2a2a2a;">
-                <h2 style="color:#f5a623;margin:0 0 16px;font-size:20px;font-weight:800;">{title}</h2>
-                <p style="color:rgba(255,255,255,0.75);line-height:1.8;margin:0 0 20px;font-size:15px;white-space:pre-line;">{body}</p>
-                {action_button}
-                <div style="background:rgba(124,58,237,0.1);border:1px solid rgba(124,58,237,0.25);border-radius:12px;padding:14px 16px;margin-top:24px;">
-                    <span style="font-size:16px;">⛓️</span>
-                    <span style="color:#a78bfa;font-weight:700;font-size:11px;letter-spacing:0.5px;margin-left:8px;">SECURED BY POLYGON BLOCKCHAIN</span>
-                    <div style="color:rgba(255,255,255,0.4);font-size:11px;margin-top:4px;">All tickets are NFTs — impossible to fake or duplicate</div>
-                </div>
-            </div>
-            <div style="background:#111;border-radius:0 0 20px 20px;border:1px solid #2a2a2a;border-top:none;padding:20px 32px;text-align:center;">
-                <p style="color:rgba(255,255,255,0.25);font-size:11px;margin:0 0 4px;">© 2026 Master Events · masterevents.events</p>
-                <p style="color:rgba(255,255,255,0.15);font-size:10px;margin:0;">You received this because you have a Master Events account.</p>
-            </div>
+    <body style="margin:0;padding:0;background:{BG_OUTER};font-family:{FONT};">
+        <div style="max-width:560px;margin:0 auto;padding:32px 16px;">
+            {inner_html}
         </div>
     </body>
     </html>
     """
+
+
+def _pill(label, color="green"):
+    dot, bg, text = PILL_COLORS.get(color, PILL_COLORS["green"])
+    return f"""
+    <div style="display:inline-flex;align-items:center;gap:6px;background:{bg};border:1px solid {text}4d;border-radius:999px;padding:5px 14px;margin-bottom:18px;">
+        <span style="width:6px;height:6px;border-radius:50%;background:{dot};display:inline-block;"></span>
+        <span style="color:{text};font-size:10px;font-weight:700;letter-spacing:1.5px;">{label}</span>
+    </div>
+    """
+
+
+def _header(icon, title, subtitle, pill_label=None, pill_color="green"):
+    pill = _pill(pill_label, pill_color) if pill_label else ""
+    return f"""
+    <div style="background:linear-gradient(160deg,#1a1a1e 0%,#0f0f11 100%);border:1px solid {BORDER};border-radius:20px 20px 0 0;padding:36px 32px 30px;text-align:center;">
+        <div style="font-size:34px;margin-bottom:14px;">{icon}</div>
+        {pill}
+        <h1 style="margin:0 0 8px;color:#fff;font-size:23px;font-weight:800;letter-spacing:-0.4px;">{title}</h1>
+        <p style="margin:0;color:rgba(255,255,255,0.5);font-size:13px;">{subtitle}</p>
+    </div>
+    """
+
+
+def _footer():
+    return f"""
+    <div style="background:{BG_OUTER};border-radius:0 0 20px 20px;border:1px solid {BORDER};border-top:none;padding:18px 32px;text-align:center;">
+        <p style="color:rgba(255,255,255,0.2);font-size:10px;margin:0;">© 2026 Master Events · masterevents.events</p>
+    </div>
+    """
+
+
+def _cta_button(url, label):
+    return f"""
+    <div style="text-align:center;">
+        <a href="{url}" style="background:{BRAND_GRADIENT};color:#fff;padding:14px 40px;border-radius:12px;text-decoration:none;font-weight:700;font-size:14px;display:inline-block;">
+            {label}
+        </a>
+    </div>
+    """
+
+
+def _detail_card(rows):
+    """rows: list of (label, value, accent_color_or_None)"""
+    items = "".join([
+        f'''<div style="display:flex;justify-content:space-between;align-items:center;padding:13px 18px;{"border-bottom:1px solid rgba(255,255,255,0.06);" if i < len(rows) - 1 else ""}">
+            <span style="color:rgba(255,255,255,0.35);font-size:11px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase;">{label}</span>
+            <span style="color:{accent or '#fff'};font-size:13px;font-weight:{700 if accent else 500};font-family:{"'SF Mono',Consolas,monospace" if accent else "inherit"};text-align:right;max-width:60%;">{value}</span>
+        </div>'''
+        for i, (label, value, accent) in enumerate(rows)
+    ])
+    return f"""
+    <div style="background:{BG_CARD};border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:4px;margin-bottom:24px;">
+        <div style="border-radius:12px;overflow:hidden;">{items}</div>
+    </div>
+    """
+
+
+def _notice(scheme, title, body):
+    bg, border, text = NOTICE_COLORS.get(scheme, NOTICE_COLORS["orange"])
+    return f"""
+    <div style="background:{bg};border:1px solid {border};border-radius:12px;padding:14px 16px;margin-bottom:20px;">
+        <div style="color:{text};font-weight:700;font-size:11px;letter-spacing:0.5px;margin-bottom:4px;">{title}</div>
+        <div style="color:rgba(255,255,255,0.5);font-size:12px;line-height:1.6;">{body}</div>
+    </div>
+    """
+
+
+def _qr_card(qr_src, caption="Show at Entrance"):
+    if not qr_src:
+        return ""
+    return f"""
+    <div style="text-align:center;margin-bottom:24px;">
+        <p style="color:rgba(255,255,255,0.4);font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;margin:0 0 14px;">{caption}</p>
+        <div style="display:inline-block;padding:14px;background:#fff;border-radius:16px;box-shadow:0 0 0 1px rgba(245,166,35,0.3),0 0 24px rgba(245,166,35,0.15);">
+            <img src="{qr_src}" width="176" height="176" alt="QR Code" style="display:block;width:176px;height:176px;border-radius:8px;" />
+        </div>
+    </div>
+    """
+
+
+def _panel(body_inner):
+    return f"""<div style="background:{BG_PANEL};padding:30px 32px;border-left:1px solid {BORDER};border-right:1px solid {BORDER};">{body_inner}</div>"""
+
+
+# ── Generic notification builder — used by send_notification() ──
+def _build_html(title, body, action_url=None, action_label="View →", icon="🎟️"):
+    action_button = _cta_button(action_url, action_label) if action_url else ""
+    inner = _header(icon, title, "Master Events · masterevents.events") + _panel(f"""
+        <p style="color:rgba(255,255,255,0.75);line-height:1.8;margin:0 0 24px;font-size:14px;white-space:pre-line;">{body}</p>
+        {action_button}
+        {_notice("purple", "SECURED BY POLYGON", "All tickets are NFTs — impossible to fake or duplicate.")}
+    """) + _footer()
+    return _shell(inner)
 
 
 def send_notification(user, type, title, body, send_email=True, action_url=None, action_label="View Ticket →", icon="🎟️"):
@@ -77,151 +199,59 @@ def send_notification(user, type, title, body, send_email=True, action_url=None,
         )
 
 
+# ═══════════════════════════════════════════════════════════════
+#  WELCOME
+# ═══════════════════════════════════════════════════════════════
+
 def notify_welcome(user):
     app_url = getattr(settings, 'FRONTEND_URL', 'https://master-events-bi7m.vercel.app')
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
-    <body style="margin:0;padding:0;background:#0f0f0f;font-family:'Helvetica Neue',Arial,sans-serif;">
-        <div style="max-width:600px;margin:0 auto;padding:24px 16px;">
-            <div style="background:linear-gradient(135deg,#f5a623,#e8920f);border-radius:20px 20px 0 0;padding:40px 32px;text-align:center;">
-                <div style="font-size:48px;margin-bottom:12px;">🎟️</div>
-                <h1 style="margin:0;color:#fff;font-size:26px;font-weight:900;letter-spacing:-0.5px;">Welcome to Master Events!</h1>
-                <p style="margin:8px 0 0;color:rgba(255,255,255,0.85);font-size:14px;">NFT-powered ticketing · masterevents.events</p>
-            </div>
-            <div style="background:#1a1a1a;padding:32px;border-left:1px solid #2a2a2a;border-right:1px solid #2a2a2a;">
-                <p style="color:rgba(255,255,255,0.85);font-size:16px;line-height:1.7;margin:0 0 24px;">
-                    Hi <strong style="color:#fff;">{user.first_name}</strong> 👋,<br><br>
-                    You're now part of Master Events — where every ticket is an NFT on the Polygon blockchain.
-                    No fakes. No scalping. Just real tickets, owned by you.
-                </p>
-                <div style="text-align:center;margin-bottom:20px;">
-                    <a href="{app_url}" style="background:linear-gradient(135deg,#f5a623,#e8920f);color:#fff;padding:16px 48px;border-radius:14px;text-decoration:none;font-weight:700;font-size:16px;display:inline-block;">
-                        Browse Events →
-                    </a>
-                </div>
-            </div>
-            <div style="background:#111;border-radius:0 0 20px 20px;border:1px solid #2a2a2a;border-top:none;padding:20px 32px;text-align:center;">
-                <p style="color:rgba(255,255,255,0.2);font-size:11px;margin:0;">© 2026 Master Events · masterevents.events</p>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
+    inner = _header("🎟️", "Welcome to Master Events", "NFT-powered ticketing", "NEW ACCOUNT", "orange") + _panel(f"""
+        <p style="color:rgba(255,255,255,0.75);font-size:15px;line-height:1.7;margin:0 0 24px;">
+            Hi <strong style="color:#fff;">{user.first_name}</strong> — you're now part of Master Events, where every ticket is an NFT on the Polygon blockchain. No fakes, no scalping — just real tickets, owned by you.
+        </p>
+        {_cta_button(app_url, "Browse Events →")}
+    """) + _footer()
     _send_email_async(
         to_email=user.email,
         subject="Welcome to Master Events! 🎟️",
-        html=html,
+        html=_shell(inner),
         text=f"Hi {user.first_name},\n\nWelcome to Master Events!\nEvery ticket is an NFT on Polygon.\n\nBrowse events: {app_url}",
     )
 
 
-# ── KEY FIX: added static_qr_base64=None param ───────────────
+# ═══════════════════════════════════════════════════════════════
+#  PAID TICKET PURCHASE — QR lives in-app only (rotating HMAC)
+# ═══════════════════════════════════════════════════════════════
+
 def notify_ticket_purchase(ticket, static_qr_base64=None):
-    """
-    Paid event: confirmation email only — NO QR image.
-    QR lives in the app only (rotating HMAC, screenshot-proof).
-    """
     user        = ticket.owner
     event       = ticket.event
     app_url     = getattr(settings, 'FRONTEND_URL', 'https://master-events-bi7m.vercel.app')
-    event_image = getattr(event, 'image', '') or ''
     currency    = getattr(event, 'currency', 'GHS')
 
-    image_block = f"""
-    <div style="border-radius:12px;overflow:hidden;margin-bottom:20px;">
-        <img src="{event_image}" alt="{event.name}"
-             style="width:100%;height:180px;object-fit:cover;display:block;"/>
-    </div>
-    """ if event_image else ""
+    rows = [
+        ("Event",    event.name,                      None),
+        ("Date",     str(event.date),                 None),
+        ("Venue",    event.venue,                     None),
+        ("Ticket ID", ticket.ticket_id,                "#f5a623"),
+        ("Quantity", f"{ticket.quantity} ticket(s)",   None),
+        ("Amount",   f"{currency} {ticket.price_paid}", None),
+    ]
 
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
-    <body style="margin:0;padding:0;background:#f5f5f5;font-family:'Inter','Helvetica Neue',Arial,sans-serif;">
-      <div style="max-width:560px;margin:0 auto;padding:24px 16px;">
-
-        <!-- Header -->
-        <div style="background:linear-gradient(135deg,#F97316,#EA6C0A);border-radius:16px 16px 0 0;padding:28px 32px;text-align:center;">
-          <div style="font-size:32px;margin-bottom:8px;">🎟️</div>
-          <h1 style="margin:0;color:#fff;font-size:20px;font-weight:700;letter-spacing:-0.3px;">Booking Confirmed</h1>
-          <p style="margin:6px 0 0;color:rgba(255,255,255,0.8);font-size:12px;">masterevents.events</p>
-        </div>
-
-        <!-- Body -->
-        <div style="background:#fff;padding:28px 32px;border-left:1px solid #e5e7eb;border-right:1px solid #e5e7eb;">
-          <p style="color:#374151;font-size:15px;margin:0 0 20px;">
-            Hi <strong>{user.first_name}</strong>, your payment was successful!
-          </p>
-
-          {image_block}
-
-          <!-- Ticket details table -->
-          <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;margin-bottom:20px;">
-            <div style="padding:12px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;">
-              <span style="color:#6b7280;font-size:13px;">Event</span>
-              <span style="color:#111;font-size:13px;font-weight:600;text-align:right;max-width:60%;">{event.name}</span>
-            </div>
-            <div style="padding:12px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;">
-              <span style="color:#6b7280;font-size:13px;">Date</span>
-              <span style="color:#111;font-size:13px;">{event.date}</span>
-            </div>
-            <div style="padding:12px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;">
-              <span style="color:#6b7280;font-size:13px;">Venue</span>
-              <span style="color:#111;font-size:13px;">{event.venue}</span>
-            </div>
-            <div style="padding:12px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;">
-              <span style="color:#6b7280;font-size:13px;">Ticket ID</span>
-              <span style="color:#F97316;font-size:13px;font-weight:700;font-family:monospace;">{ticket.ticket_id}</span>
-            </div>
-            <div style="padding:12px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;">
-              <span style="color:#6b7280;font-size:13px;">Quantity</span>
-              <span style="color:#111;font-size:13px;">{ticket.quantity} ticket(s)</span>
-            </div>
-            <div style="padding:12px 16px;display:flex;justify-content:space-between;">
-              <span style="color:#6b7280;font-size:13px;">Amount Paid</span>
-              <span style="color:#111;font-size:13px;font-weight:600;">{currency} {ticket.price_paid}</span>
-            </div>
-          </div>
-
-          <!-- Important notice — QR is in app only -->
-          <div style="background:#fef3c7;border:1px solid #fde68a;border-radius:10px;padding:14px 16px;margin-bottom:20px;">
-            <div style="font-weight:700;font-size:12px;color:#92400e;margin-bottom:4px;">📱 Show your QR at the gate</div>
-            <div style="font-size:12px;color:#78350f;line-height:1.6;">
-              Your entry QR code is in the Master Events app — it rotates every 10 seconds for security.
-              <strong>Do not screenshot it</strong>. Open the app at the gate for instant scanning.
-            </div>
-          </div>
-
-          <!-- Blockchain notice -->
-          <div style="background:#f5f3ff;border:1px solid #ddd6fe;border-radius:10px;padding:14px 16px;margin-bottom:24px;">
-            <div style="font-weight:700;font-size:11px;color:#5b21b6;margin-bottom:3px;">⛓️ NFT MINTING ON POLYGON</div>
-            <div style="font-size:12px;color:#6d28d9;">Your ticket is being minted as an NFT — permanent, unforgeable, yours forever.</div>
-          </div>
-
-          <div style="text-align:center;">
-            <a href="{app_url}" style="background:linear-gradient(135deg,#F97316,#EA6C0A);color:#fff;padding:13px 36px;border-radius:10px;text-decoration:none;font-weight:600;font-size:14px;display:inline-block;">
-              Open App to View QR →
-            </a>
-          </div>
-        </div>
-
-        <!-- Footer -->
-        <div style="background:#f9fafb;border-radius:0 0 16px 16px;border:1px solid #e5e7eb;border-top:none;padding:16px 32px;text-align:center;">
-          <p style="color:#9ca3af;font-size:11px;margin:0;">© 2026 Master Events · masterevents.events · Secured by Polygon</p>
-        </div>
-
-      </div>
-    </body>
-    </html>
-    """
+    inner = _header("🎟️", "Booking Confirmed", event.name, "PAYMENT SUCCESSFUL", "green") + _panel(f"""
+        <p style="color:rgba(255,255,255,0.75);font-size:14px;line-height:1.6;margin:0 0 24px;">
+            Hi <strong style="color:#fff;">{user.first_name}</strong> — your payment was successful. Details below.
+        </p>
+        {_detail_card(rows)}
+        {_notice("amber", "SHOW YOUR QR AT THE GATE", "Your entry QR rotates every 10 seconds for security — it lives in the app only. Do not screenshot it. Open the app at the gate for instant scanning.")}
+        {_notice("purple", "NFT MINTING ON POLYGON", "Your ticket is being minted as an NFT — permanent, unforgeable, yours forever.")}
+        {_cta_button(app_url, "Open App to View QR →")}
+    """) + _footer()
 
     _send_email_async(
         to_email=user.email,
         subject=f"🎟️ Booking Confirmed — {event.name}",
-        html=html,
+        html=_shell(inner),
         text=(
             f"Hi {user.first_name},\n\n"
             f"Your booking for {event.name} is confirmed!\n\n"
@@ -235,7 +265,6 @@ def notify_ticket_purchase(ticket, static_qr_base64=None):
         ),
     )
 
-    # Notify organizer
     send_notification(
         user=event.organizer,
         type='sale',
@@ -248,22 +277,18 @@ def notify_ticket_purchase(ticket, static_qr_base64=None):
             f"🎟️ Ticket ID: {ticket.ticket_id}"
         ),
         send_email=True,
-        action_url=getattr(settings, 'FRONTEND_URL', 'https://master-events-bi7m.vercel.app'),
+        action_url=app_url,
         action_label="View Dashboard →",
         icon="💰",
     )
 
-# ── KEY FIX: added new_ticket=None, static_qr_base64=None params ──
+
+# ═══════════════════════════════════════════════════════════════
+#  TICKET TRANSFER
+# ═══════════════════════════════════════════════════════════════
+
 def notify_ticket_transfer(ticket, from_user, to_user, new_ticket=None, static_qr_base64=None):
     app_url = getattr(settings, 'FRONTEND_URL', 'https://master-events-bi7m.vercel.app')
-
-    static_qr_block = f"""
-    <div style="text-align:center;margin:16px 0;background:rgba(245,166,35,0.05);border:1px solid rgba(245,166,35,0.15);border-radius:14px;padding:16px;">
-        <p style="color:rgba(255,255,255,0.5);font-size:11px;margin:0 0 10px;text-transform:uppercase;letter-spacing:1px;">Your New Emergency Backup QR</p>
-        <img src="data:image/png;base64,{static_qr_base64}" style="width:160px;height:160px;border-radius:10px;background:#fff;padding:6px;" />
-        <p style="color:rgba(255,255,255,0.3);font-size:10px;margin:8px 0 0;">Single-use · Invalidates on transfer</p>
-    </div>
-    """ if static_qr_base64 else ""
 
     send_notification(
         user=from_user,
@@ -283,56 +308,29 @@ def notify_ticket_transfer(ticket, from_user, to_user, new_ticket=None, static_q
         action_url=app_url,
     )
 
-    # Email to receiver with new static QR if available
     if new_ticket and static_qr_base64:
-        html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
-        <body style="margin:0;padding:0;background:#0f0f0f;font-family:'Helvetica Neue',Arial,sans-serif;">
-            <div style="max-width:600px;margin:0 auto;padding:24px 16px;">
-                <div style="background:linear-gradient(135deg,#f5a623,#e8920f);border-radius:20px 20px 0 0;padding:28px 32px;text-align:center;">
-                    <div style="font-size:36px;margin-bottom:8px;">🎟️</div>
-                    <h1 style="margin:0;color:#fff;font-size:22px;font-weight:900;">You Received a Ticket!</h1>
-                    <p style="margin:6px 0 0;color:rgba(255,255,255,0.85);font-size:13px;">{ticket.event.name}</p>
-                </div>
-                <div style="background:#1a1a1a;padding:28px 32px;border-left:1px solid #2a2a2a;border-right:1px solid #2a2a2a;">
-                    <p style="color:rgba(255,255,255,0.8);font-size:15px;margin:0 0 20px;">
-                        Hi <strong style="color:#fff;">{to_user.first_name}</strong>,<br><br>
-                        {from_user.get_full_name() or from_user.email} just transferred a ticket to you!
-                    </p>
-                    <div style="background:#111;border:1px solid #2a2a2a;border-radius:14px;padding:18px;margin-bottom:20px;">
-                        <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #222;">
-                            <span style="color:rgba(255,255,255,0.4);font-size:13px;">Event</span>
-                            <span style="color:#fff;font-size:13px;font-weight:700;">{ticket.event.name}</span>
-                        </div>
-                        <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #222;">
-                            <span style="color:rgba(255,255,255,0.4);font-size:13px;">Date</span>
-                            <span style="color:#fff;font-size:13px;">{ticket.event.date}</span>
-                        </div>
-                        <div style="display:flex;justify-content:space-between;padding:8px 0;">
-                            <span style="color:rgba(255,255,255,0.4);font-size:13px;">Venue</span>
-                            <span style="color:#fff;font-size:13px;">{ticket.event.venue}</span>
-                        </div>
-                    </div>
-                    {static_qr_block}
-                    <div style="text-align:center;">
-                        <a href="{app_url}" style="background:linear-gradient(135deg,#f5a623,#e8920f);color:#fff;padding:14px 40px;border-radius:12px;text-decoration:none;font-weight:700;font-size:15px;display:inline-block;">
-                            View My Ticket →
-                        </a>
-                    </div>
-                </div>
-                <div style="background:#111;border-radius:0 0 20px 20px;border:1px solid #2a2a2a;border-top:none;padding:20px 32px;text-align:center;">
-                    <p style="color:rgba(255,255,255,0.2);font-size:11px;margin:0;">© 2026 Master Events · masterevents.events</p>
-                </div>
-            </div>
-        </body>
-        </html>
-        """
+        qr_url = _upload_base64_qr(static_qr_base64, f"static_qr_{new_ticket.ticket_id}")
+
+        rows = [
+            ("Event", ticket.event.name, None),
+            ("Date",  str(ticket.event.date), None),
+            ("Venue", ticket.event.venue, None),
+        ]
+
+        inner = _header("🎟️", "You Received a Ticket!", ticket.event.name, "INCOMING TRANSFER", "orange") + _panel(f"""
+            <p style="color:rgba(255,255,255,0.75);font-size:14px;line-height:1.6;margin:0 0 24px;">
+                Hi <strong style="color:#fff;">{to_user.first_name}</strong> — {from_user.get_full_name() or from_user.email} just transferred a ticket to you!
+            </p>
+            {_detail_card(rows)}
+            {_qr_card(qr_url, "Your New Backup QR")}
+            <p style="color:rgba(255,255,255,0.3);font-size:11px;text-align:center;margin:-14px 0 24px;">Single-use · Invalidates on transfer</p>
+            {_cta_button(app_url, "View My Ticket →")}
+        """) + _footer()
+
         _send_email_async(
             to_email=to_user.email,
             subject=f"🎟️ You Received a Ticket — {ticket.event.name}",
-            html=html,
+            html=_shell(inner),
             text=(
                 f"Hi {to_user.first_name},\n\n"
                 f"{from_user.get_full_name() or from_user.email} transferred a ticket to you!\n\n"
@@ -361,6 +359,10 @@ def notify_ticket_transfer(ticket, from_user, to_user, new_ticket=None, static_q
             icon="🎟️",
         )
 
+
+# ═══════════════════════════════════════════════════════════════
+#  RESALE — all use send_notification, styled automatically
+# ═══════════════════════════════════════════════════════════════
 
 def notify_resale_listed(ticket, user):
     app_url = getattr(settings, 'FRONTEND_URL', 'https://master-events-bi7m.vercel.app')
@@ -484,46 +486,30 @@ def notify_withdrawal(wallet, amount, method, reference):
     )
 
 
+# ═══════════════════════════════════════════════════════════════
+#  PASSWORD RESET
+# ═══════════════════════════════════════════════════════════════
+
 def notify_password_reset(user, reset_url):
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head><meta charset="UTF-8"></head>
-    <body style="margin:0;padding:0;background:#0f0f0f;font-family:Arial,sans-serif;">
-        <div style="max-width:600px;margin:0 auto;padding:24px 16px;">
-            <div style="background:linear-gradient(135deg,#f5a623,#e8920f);border-radius:20px 20px 0 0;padding:32px;text-align:center;">
-                <div style="font-size:32px;margin-bottom:8px;">🔐</div>
-                <h1 style="margin:0;color:#fff;font-size:22px;font-weight:900;">Reset Your Password</h1>
-                <p style="margin:6px 0 0;color:rgba(255,255,255,0.8);font-size:12px;">Master Events · masterevents.events</p>
-            </div>
-            <div style="background:#1a1a1a;padding:32px;border:1px solid #2a2a2a;border-top:none;">
-                <p style="color:rgba(255,255,255,0.75);font-size:15px;line-height:1.8;margin:0 0 24px;">
-                    Hi {user.first_name},<br><br>
-                    We received a request to reset your Master Events password.
-                    Click below — this link expires in <strong style="color:#f5a623;">30 minutes</strong>.
-                </p>
-                <div style="text-align:center;margin:28px 0;">
-                    <a href="{reset_url}" style="background:linear-gradient(135deg,#f5a623,#e8920f);color:#fff;padding:16px 40px;border-radius:12px;text-decoration:none;font-weight:700;font-size:16px;display:inline-block;">
-                        Reset Password →
-                    </a>
-                </div>
-                <p style="color:rgba(255,255,255,0.35);font-size:12px;">If you didn't request this, ignore this email.</p>
-            </div>
-            <div style="background:#111;border-radius:0 0 20px 20px;border:1px solid #2a2a2a;border-top:none;padding:16px;text-align:center;">
-                <p style="color:rgba(255,255,255,0.2);font-size:10px;margin:0;">© 2026 Master Events · masterevents.events</p>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
+    inner = _header("🔐", "Reset Your Password", "Master Events · masterevents.events") + _panel(f"""
+        <p style="color:rgba(255,255,255,0.75);font-size:14px;line-height:1.8;margin:0 0 24px;">
+            Hi {user.first_name} — we received a request to reset your password. Click below — this link expires in <strong style="color:#f5a623;">30 minutes</strong>.
+        </p>
+        {_cta_button(reset_url, "Reset Password →")}
+        <p style="color:rgba(255,255,255,0.3);font-size:12px;text-align:center;margin-top:24px;">If you didn't request this, ignore this email.</p>
+    """) + _footer()
     _send_email_async(
         to_email=user.email,
         subject="Master Events — Reset Your Password",
-        html=html,
+        html=_shell(inner),
         text=f"Hi {user.first_name},\n\nReset your password (expires in 30 minutes):\n{reset_url}\n\nIf you didn't request this, ignore this email.",
     )
     return True
 
+
+# ═══════════════════════════════════════════════════════════════
+#  FREE EVENT REGISTRATION
+# ═══════════════════════════════════════════════════════════════
 
 def notify_free_registration(reg, static_qr_base64=None):
     """Email attendee their free event registration pass"""
@@ -531,72 +517,31 @@ def notify_free_registration(reg, static_qr_base64=None):
     event   = reg.event
     app_url = getattr(settings, 'FRONTEND_URL', 'https://master-events-bi7m.vercel.app')
 
-    static_qr_block = f"""
-    <div style="text-align:center;margin-bottom:20px;">
-        <p style="color:rgba(255,255,255,0.5);font-size:12px;margin-bottom:8px;">Show this QR at the entrance</p>
-        <img src="data:image/png;base64,{static_qr_base64}" style="width:180px;height:180px;border-radius:12px;background:#fff;padding:8px;" />
-    </div>
-    """ if static_qr_base64 else ""
+    qr_url = _upload_base64_qr(static_qr_base64, f"static_qr_{reg.registration_id}")
 
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
-    <body style="margin:0;padding:0;background:#0f0f0f;font-family:'Helvetica Neue',Arial,sans-serif;">
-        <div style="max-width:600px;margin:0 auto;padding:24px 16px;">
-            <div style="background:linear-gradient(135deg,#f5a623,#e8920f);border-radius:20px 20px 0 0;padding:28px 32px;text-align:center;">
-                <div style="font-size:36px;margin-bottom:8px;">🎟️</div>
-                <h1 style="margin:0;color:#fff;font-size:22px;font-weight:900;">You're Registered!</h1>
-                <p style="margin:6px 0 0;color:rgba(255,255,255,0.85);font-size:13px;">Your entry pass for {event.name}</p>
-            </div>
-            <div style="background:#1a1a1a;padding:28px 32px;border-left:1px solid #2a2a2a;border-right:1px solid #2a2a2a;">
-                <p style="color:rgba(255,255,255,0.8);font-size:15px;margin:0 0 20px;">
-                    Hi <strong style="color:#fff;">{user.first_name}</strong>, your spot is confirmed!
-                </p>
-                <div style="background:#111;border:1px solid #2a2a2a;border-radius:14px;padding:18px;margin-bottom:20px;">
-                    <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #222;">
-                        <span style="color:rgba(255,255,255,0.4);font-size:13px;">Event</span>
-                        <span style="color:#fff;font-size:13px;font-weight:700;">{event.name}</span>
-                    </div>
-                    <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #222;">
-                        <span style="color:rgba(255,255,255,0.4);font-size:13px;">Date</span>
-                        <span style="color:#fff;font-size:13px;">{event.date}</span>
-                    </div>
-                    <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #222;">
-                        <span style="color:rgba(255,255,255,0.4);font-size:13px;">Venue</span>
-                        <span style="color:#fff;font-size:13px;">{event.venue}</span>
-                    </div>
-                    <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #222;">
-                        <span style="color:rgba(255,255,255,0.4);font-size:13px;">Spots</span>
-                        <span style="color:#fff;font-size:13px;">{reg.quantity}</span>
-                    </div>
-                    <div style="display:flex;justify-content:space-between;padding:8px 0;">
-                        <span style="color:rgba(255,255,255,0.4);font-size:13px;">Entry Pass ID</span>
-                        <span style="color:#f5a623;font-size:13px;font-weight:700;font-family:monospace;">{reg.registration_id}</span>
-                    </div>
-                </div>
-                {static_qr_block}
-                <div style="background:rgba(245,166,35,0.08);border:1px solid rgba(245,166,35,0.2);border-radius:12px;padding:14px 16px;margin-bottom:24px;">
-                    <div style="color:#f5a623;font-weight:700;font-size:11px;margin-bottom:4px;">🎪 SHOW AT THE GATE</div>
-                    <div style="color:rgba(255,255,255,0.5);font-size:12px;">Present this QR code or your entry pass ID to gain entry. Open the Master Events app for a live rotating QR.</div>
-                </div>
-                <div style="text-align:center;">
-                    <a href="{app_url}" style="background:linear-gradient(135deg,#f5a623,#e8920f);color:#fff;padding:14px 40px;border-radius:12px;text-decoration:none;font-weight:700;font-size:15px;display:inline-block;">
-                        Open Master Events →
-                    </a>
-                </div>
-            </div>
-            <div style="background:#111;border-radius:0 0 20px 20px;border:1px solid #2a2a2a;border-top:none;padding:20px 32px;text-align:center;">
-                <p style="color:rgba(255,255,255,0.2);font-size:11px;margin:0;">© 2026 Master Events · masterevents.events</p>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
+    rows = [
+        ("Event",    event.name,             None),
+        ("Date",     str(event.date),        None),
+        ("Venue",    event.venue,            None),
+        ("Spots",    str(reg.quantity),      None),
+        ("Pass ID",  reg.registration_id,    "#f5a623"),
+    ]
+
+    inner = _header("🎟️", "You're In", event.name, "CONFIRMED", "green") + _panel(f"""
+        <p style="color:rgba(255,255,255,0.75);font-size:14px;line-height:1.6;margin:0 0 24px;">
+            Hi <strong style="color:#fff;">{user.first_name}</strong> — your spot for this event is confirmed. Details below.
+        </p>
+        {_detail_card(rows)}
+        {_qr_card(qr_url)}
+        {_notice("orange", "AT THE GATE", "Present this QR code or your Pass ID above. Open the Master Events app for a live rotating QR if this one won't scan.")}
+        {_notice("purple", "SECURED BY POLYGON", "This pass can't be duplicated or faked.")}
+        {_cta_button(app_url, "Open Master Events →")}
+    """) + _footer()
+
     _send_email_async(
         to_email=user.email,
         subject=f"🎟️ You're In — {event.name}",
-        html=html,
+        html=_shell(inner),
         text=(
             f"Hi {user.first_name},\n\n"
             f"You're registered for {event.name}!\n\n"
@@ -608,122 +553,54 @@ def notify_free_registration(reg, static_qr_base64=None):
     )
 
 
-
 def notify_free_registration_with_pdf(reg, qr_b64, pdf_b64=None):
-    """
-    Free event: send PDF ticket as attachment + QR in email body.
-    """
+    """Free event: send PDF ticket as attachment + QR in email body."""
     user    = reg.attendee
     event   = reg.event
     app_url = getattr(settings, 'FRONTEND_URL', 'https://master-events-bi7m.vercel.app')
 
-    qr_block = f"""
-    <div style="text-align:center;margin:20px 0;">
-        <p style="color:#6b7280;font-size:12px;margin-bottom:8px;">Show this QR code at the entrance</p>
-        <img src="data:image/png;base64,{qr_b64}"
-             style="width:180px;height:180px;border-radius:10px;background:#fff;padding:8px;border:1px solid #e5e7eb;" />
-        <p style="color:#9ca3af;font-size:11px;margin-top:6px;">
-            Your PDF ticket is attached · Also in the Master Events app
+    qr_url = _upload_base64_qr(qr_b64, f"pdf_qr_{reg.registration_id}")
+
+    rows = [
+        ("Event",   event.name,           None),
+        ("Date",    str(event.date),      None),
+        ("Venue",   event.venue,          None),
+        ("Spots",   str(reg.quantity),    None),
+        ("Pass ID", reg.registration_id,  "#f5a623"),
+    ]
+
+    pdf_notice = _notice("green", "PDF ATTACHED", "Your PDF ticket is attached — print it or save it as a backup entry pass.") if pdf_b64 else ""
+
+    inner = _header("🎟️", "You're Registered!", f"{event.name} · Free", "CONFIRMED · NO CHARGE", "green") + _panel(f"""
+        <p style="color:rgba(255,255,255,0.75);font-size:14px;line-height:1.6;margin:0 0 24px;">
+            Hi <strong style="color:#fff;">{user.first_name}</strong> — your spot is confirmed, no charge.
         </p>
-    </div>
-    """ if qr_b64 else ""
+        {_detail_card(rows)}
+        {_qr_card(qr_url, "Show this QR at the entrance")}
+        {pdf_notice}
+        {_notice("orange", "AT THE GATE", "Show the QR code (from this email, the attached PDF, or the app) to door staff for instant entry.")}
+        {_cta_button(app_url, "Open in App →")}
+    """) + _footer()
 
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
-    <body style="margin:0;padding:0;background:#f5f5f5;font-family:'Inter','Helvetica Neue',Arial,sans-serif;">
-      <div style="max-width:560px;margin:0 auto;padding:24px 16px;">
+    attachments = None
+    if pdf_b64:
+        attachments = [{
+            "filename": f"ticket-{reg.registration_id}.pdf",
+            "content":  pdf_b64,
+        }]
 
-        <div style="background:linear-gradient(135deg,#16a34a,#15803d);border-radius:16px 16px 0 0;padding:28px 32px;text-align:center;">
-          <div style="font-size:32px;margin-bottom:8px;">🎟️</div>
-          <h1 style="margin:0;color:#fff;font-size:20px;font-weight:700;">You're Registered!</h1>
-          <p style="margin:6px 0 0;color:rgba(255,255,255,0.85);font-size:13px;">{event.name}</p>
-        </div>
-
-        <div style="background:#fff;padding:28px 32px;border-left:1px solid #e5e7eb;border-right:1px solid #e5e7eb;">
-          <p style="color:#374151;font-size:15px;margin:0 0 18px;">
-            Hi <strong>{user.first_name}</strong>, your spot is confirmed — <strong>no charge</strong>!
-          </p>
-
-          <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;margin-bottom:18px;">
-            <div style="padding:11px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;">
-              <span style="color:#6b7280;font-size:13px;">Event</span>
-              <span style="color:#111;font-size:13px;font-weight:600;">{event.name}</span>
-            </div>
-            <div style="padding:11px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;">
-              <span style="color:#6b7280;font-size:13px;">Date</span>
-              <span style="color:#111;font-size:13px;">{event.date}</span>
-            </div>
-            <div style="padding:11px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;">
-              <span style="color:#6b7280;font-size:13px;">Venue</span>
-              <span style="color:#111;font-size:13px;">{event.venue}</span>
-            </div>
-            <div style="padding:11px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;">
-              <span style="color:#6b7280;font-size:13px;">Spots</span>
-              <span style="color:#111;font-size:13px;">{reg.quantity}</span>
-            </div>
-            <div style="padding:11px 16px;display:flex;justify-content:space-between;">
-              <span style="color:#6b7280;font-size:13px;">Entry Pass ID</span>
-              <span style="color:#16a34a;font-size:13px;font-weight:700;font-family:monospace;">{reg.registration_id}</span>
-            </div>
-          </div>
-
-          {qr_block}
-
-          {"<div style='background:#dcfce7;border:1px solid #bbf7d0;border-radius:10px;padding:12px 16px;margin-bottom:16px;font-size:12px;color:#15803d;'><strong>📎 Your PDF ticket is attached</strong> — print it or save it as a backup entry pass.</div>" if pdf_b64 else ""}
-
-          <div style="background:#fef3c7;border:1px solid #fde68a;border-radius:10px;padding:12px 16px;margin-bottom:20px;">
-            <div style="font-weight:700;font-size:12px;color:#92400e;margin-bottom:3px;">🎪 AT THE GATE</div>
-            <div style="font-size:12px;color:#78350f;line-height:1.6;">
-              Show the QR code (from this email or the app) to the door staff for instant entry.
-            </div>
-          </div>
-
-          <div style="text-align:center;">
-            <a href="{app_url}" style="background:linear-gradient(135deg,#16a34a,#15803d);color:#fff;padding:13px 36px;border-radius:10px;text-decoration:none;font-weight:600;font-size:14px;display:inline-block;">
-              Open in App →
-            </a>
-          </div>
-        </div>
-
-        <div style="background:#f9fafb;border-radius:0 0 16px 16px;border:1px solid #e5e7eb;border-top:none;padding:16px 32px;text-align:center;">
-          <p style="color:#9ca3af;font-size:11px;margin:0;">© 2026 Master Events · masterevents.events</p>
-        </div>
-      </div>
-    </body>
-    </html>
-    """
-
-    def _send():
-        try:
-            resend.api_key = settings.RESEND_API_KEY
-            params = {
-                "from":    settings.DEFAULT_FROM_EMAIL,
-                "to":      [user.email],
-                "subject": f"🎟️ Your Free Ticket — {event.name}",
-                "html":    html,
-                "text": (
-                    f"Hi {user.first_name},\n\n"
-                    f"You're registered for {event.name}!\n\n"
-                    f"Date: {event.date}\n"
-                    f"Venue: {event.venue}\n"
-                    f"Entry Pass ID: {reg.registration_id}\n\n"
-                    f"Your PDF ticket is attached.\n"
-                    f"Open Master Events app: {app_url}"
-                ),
-            }
-            # Attach PDF if generated
-            if pdf_b64:
-                import base64
-                params["attachments"] = [{
-                    "filename": f"ticket-{reg.registration_id}.pdf",
-                    "content":  pdf_b64,
-                }]
-            r = resend.Emails.send(params)
-            print(f"✅ PDF ticket email sent: {r}")
-        except Exception as e:
-            print(f"❌ PDF ticket email error: {e}")
-
-    import threading
-    threading.Thread(target=_send, daemon=True).start()
+    _send_email_async(
+        to_email=user.email,
+        subject=f"🎟️ Your Free Ticket — {event.name}",
+        html=_shell(inner),
+        text=(
+            f"Hi {user.first_name},\n\n"
+            f"You're registered for {event.name}!\n\n"
+            f"Date: {event.date}\n"
+            f"Venue: {event.venue}\n"
+            f"Entry Pass ID: {reg.registration_id}\n\n"
+            f"Your PDF ticket is attached.\n"
+            f"Open Master Events app: {app_url}"
+        ),
+        attachments=attachments,
+    )

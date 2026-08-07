@@ -21,13 +21,14 @@ urlpatterns = [
     path('delete-account/',       views.delete_account,      name='delete-account'),
 
     # ── Super Admin ───────────────────────────────────────────
-    path('admin/login/',                          views.admin_login,         name='admin-login'),
-    path('admin/overview/',                       views.admin_overview,      name='admin-overview'),
-    path('admin/organizers/',                     views.admin_organizers,    name='admin-organizers'),
-    path('admin/events/',                         views.admin_events,        name='admin-events'),
-    path('admin/transactions/',                   views.admin_transactions,  name='admin-transactions'),
-    path('admin/users/<int:user_id>/suspend/',    views.admin_suspend_user,  name='admin-suspend-user'),
-    path('admin/events/<int:event_id>/toggle/',   views.admin_toggle_event,  name='admin-toggle-event'),
+    path('admin/login/',                          views.admin_login,          name='admin-login'),
+    path('admin/overview/',                       views.admin_overview,       name='admin-overview'),
+    path('admin/organizers/',                     views.admin_organizers,     name='admin-organizers'),
+    path('admin/events/',                         views.admin_events,         name='admin-events'),
+    path('admin/transactions/',                   views.admin_transactions,   name='admin-transactions'),
+    path('admin/users/<int:user_id>/suspend/',    views.admin_suspend_user,   name='admin-suspend-user'),
+    path('admin/events/<int:event_id>/toggle/',   views.admin_toggle_event,   name='admin-toggle-event'),
+    path('admin/events/<int:event_id>/approve/',  views.admin_approve_event,  name='admin-approve-event'),
     path('google/',  views.google_auth,  name='google-auth'),
     path('google/callback/', views.google_auth_callback, name='google-auth-callback'),
 ]

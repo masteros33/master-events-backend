@@ -41,46 +41,22 @@ def _send_verification_email(user):
     token_str = str(vt.token)
     verify_url = f"{getattr(settings, 'FRONTEND_URL', 'https://masterevents.events')}?verify={token_str}"
 
+    from utils.emails import _shell, _header, _panel, _cta_button, _footer
+
+    inner = _header("✉️", "Verify Your Email", "Master Events · masterevents.events", "ONE STEP LEFT", "orange") + _panel(f"""
+        <p style="color:rgba(255,255,255,0.75);font-size:14px;line-height:1.8;margin:0 0 24px;">
+            Hi {user.first_name} — thanks for joining Master Events! Click below to verify your email address. This link expires in <strong style="color:#f5a623;">24 hours</strong>.
+        </p>
+        {_cta_button(verify_url, "Verify Email →")}
+        <p style="color:rgba(255,255,255,0.3);font-size:12px;text-align:center;margin-top:24px;">If you didn't create an account, ignore this email.</p>
+    """) + _footer()
+
     resend.api_key = settings.RESEND_API_KEY
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head><meta charset="UTF-8"></head>
-    <body style="margin:0;padding:0;background:#0f0f0f;font-family:'Helvetica Neue',Arial,sans-serif;">
-        <div style="max-width:600px;margin:0 auto;padding:24px 16px;">
-            <div style="background:linear-gradient(135deg,#F97316,#EA6C0A);border-radius:20px 20px 0 0;padding:32px;text-align:center;">
-                <div style="font-size:32px;margin-bottom:8px;">✉️</div>
-                <h1 style="margin:0;color:#fff;font-size:22px;font-weight:900;">Verify Your Email</h1>
-                <p style="margin:6px 0 0;color:rgba(255,255,255,0.8);font-size:13px;">Master Events Ghana</p>
-            </div>
-            <div style="background:#1a1a1a;padding:32px;border-left:1px solid #2a2a2a;border-right:1px solid #2a2a2a;">
-                <p style="color:rgba(255,255,255,0.75);font-size:15px;line-height:1.8;margin:0 0 24px;">
-                    Hi {user.first_name},<br><br>
-                    Thanks for joining Master Events! Click below to verify your email address.
-                    This link expires in <strong style="color:#F97316;">24 hours</strong>.
-                </p>
-                <div style="text-align:center;margin:28px 0;">
-                    <a href="{verify_url}"
-                       style="background:linear-gradient(135deg,#F97316,#EA6C0A);color:#fff;padding:16px 40px;border-radius:12px;text-decoration:none;font-weight:700;font-size:16px;display:inline-block;">
-                        Verify Email →
-                    </a>
-                </div>
-                <p style="color:rgba(255,255,255,0.35);font-size:12px;text-align:center;">
-                    If you didn't create an account, ignore this email.
-                </p>
-            </div>
-            <div style="background:#111;border-radius:0 0 20px 20px;border:1px solid #2a2a2a;border-top:none;padding:16px;text-align:center;">
-                <p style="color:rgba(255,255,255,0.2);font-size:10px;margin:0;">© 2026 Master Events Ghana</p>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
     resend.Emails.send({
         "from":    settings.DEFAULT_FROM_EMAIL,
         "to":      [user.email],
         "subject": "Master Events — Verify Your Email",
-        "html":    html,
+        "html":    _shell(inner),
         "text":    f"Hi {user.first_name},\n\nVerify your email:\n{verify_url}\n\nExpires in 24 hours.",
     })
     print(f"✅ Verification email sent to {user.email}")
@@ -543,29 +519,12 @@ def admin_events(request):
         'tickets_sold':    e.tickets_sold,
         'sales_open':      e.sales_open,
         'is_active':       e.is_active,
+        # ── NEW: expose approval status to the admin dashboard so
+        # EventsTab can show a "Pending Review" badge and gate the
+        # Approve/Reject buttons correctly. ──
+        'is_approved':     e.is_approved,
         'revenue':         round(float(e.price) * e.tickets_sold * 0.95, 2),
     } for e in events]
-    return Response(data)
-
-
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def admin_transactions(request):
-    if not is_super_admin(request.user):
-        return Response({'error': 'Forbidden'}, status=403)
-
-    from payments.models import Transaction
-    txns = Transaction.objects.select_related('wallet__user').order_by('-created_at')[:200]
-    data = [{
-        'id':          t.id,
-        'type':        t.type,
-        'amount':      float(t.amount),
-        'description': t.description,
-        'reference':   t.reference,
-        'status':      t.status,
-        'user':        t.wallet.user.email if t.wallet else 'N/A',
-        'created_at':  t.created_at.isoformat(),
-    } for t in txns]
     return Response(data)
 
 
@@ -582,6 +541,55 @@ def admin_suspend_user(request, user_id):
     user.save(update_fields=['is_suspended'])
     action = 'suspended' if user.is_suspended else 'reinstated'
     return Response({'message': f'User {action}', 'is_suspended': user.is_suspended})
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def admin_toggle_event(request, event_id):
+    if not is_super_admin(request.user):
+        return Response({'error': 'Forbidden'}, status=403)
+    from events.models import Event
+    try:
+        event = Event.objects.get(pk=event_id)
+    except Event.DoesNotExist:
+        return Response({'error': 'Event not found'}, status=404)
+    event.is_active = not event.is_active
+    event.save(update_fields=['is_active'])
+    return Response({
+        'message':   f'Event {"activated" if event.is_active else "deactivated"}',
+        'is_active': event.is_active,
+    })
+
+
+# ── NEW: Admin approve/reject an event ─────────────────────────
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def admin_approve_event(request, event_id):
+    """
+    Toggles is_approved. Reused for both approve and reject via the
+    same endpoint — the frontend sends the desired action, but the
+    simplest and safest implementation is a straight toggle: approve
+    sets True, reject sets it back to False (an event can be
+    un-approved later too, e.g. if a report comes in after launch).
+    """
+    if not is_super_admin(request.user):
+        return Response({'error': 'Forbidden'}, status=403)
+    from events.models import Event
+    try:
+        event = Event.objects.get(pk=event_id)
+    except Event.DoesNotExist:
+        return Response({'error': 'Event not found'}, status=404)
+
+    action = request.data.get('action', 'approve')  # 'approve' or 'reject'
+    event.is_approved = (action == 'approve')
+    event.save(update_fields=['is_approved'])
+
+    print(f"{'✅ Approved' if event.is_approved else '❌ Rejected'} event: {event.name} (id={event.id}) by admin {request.user.email}")
+
+    return Response({
+        'message':     f'Event {"approved" if event.is_approved else "rejected"}',
+        'is_approved': event.is_approved,
+    })
 
 
 @api_view(['POST'])
