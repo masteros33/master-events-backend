@@ -374,8 +374,7 @@ def transaction_history(request):
     return Response(serializer.data)
 
 
-
-# ── Add these two views at the bottom of payments/views.py ────
+# ── Attendee wallet ─────────────────────────────────────────────
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -467,4 +466,22 @@ def attendee_withdraw(request):
         'reference':   reference,
         'status':      tx_status,
         'new_balance': float(wallet.balance),
+    })
+
+
+# ── Organizer live activity feed ────────────────────────────────
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def organizer_activity(request):
+    wallet, _ = Wallet.objects.get_or_create(user=request.user)
+    transactions = wallet.transactions.all().order_by('-created_at')[:15]
+    return Response({
+        'transactions': [{
+            'type':        t.type,
+            'amount':      float(t.amount),
+            'description': t.description,
+            'reference':   t.reference,
+            'status':      t.status,
+            'created_at':  t.created_at.isoformat(),
+        } for t in transactions],
     })

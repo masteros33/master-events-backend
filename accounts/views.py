@@ -519,12 +519,30 @@ def admin_events(request):
         'tickets_sold':    e.tickets_sold,
         'sales_open':      e.sales_open,
         'is_active':       e.is_active,
-        # ── NEW: expose approval status to the admin dashboard so
-        # EventsTab can show a "Pending Review" badge and gate the
-        # Approve/Reject buttons correctly. ──
         'is_approved':     e.is_approved,
         'revenue':         round(float(e.price) * e.tickets_sold * 0.95, 2),
     } for e in events]
+    return Response(data)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def admin_transactions(request):
+    if not is_super_admin(request.user):
+        return Response({'error': 'Forbidden'}, status=403)
+
+    from payments.models import Transaction
+    txns = Transaction.objects.select_related('wallet__user').order_by('-created_at')[:200]
+    data = [{
+        'id':          t.id,
+        'type':        t.type,
+        'amount':      float(t.amount),
+        'description': t.description,
+        'reference':   t.reference,
+        'status':      t.status,
+        'user':        t.wallet.user.email if t.wallet else 'N/A',
+        'created_at':  t.created_at.isoformat(),
+    } for t in txns]
     return Response(data)
 
 
@@ -561,16 +579,15 @@ def admin_toggle_event(request, event_id):
     })
 
 
-# ── NEW: Admin approve/reject an event ─────────────────────────
+# ── Admin approve/reject an event ──────────────────────────────
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def admin_approve_event(request, event_id):
     """
     Toggles is_approved. Reused for both approve and reject via the
-    same endpoint — the frontend sends the desired action, but the
-    simplest and safest implementation is a straight toggle: approve
-    sets True, reject sets it back to False (an event can be
-    un-approved later too, e.g. if a report comes in after launch).
+    same endpoint — approve sets True, reject sets it back to False
+    (an event can be un-approved later too, e.g. if a report comes in
+    after launch).
     """
     if not is_super_admin(request.user):
         return Response({'error': 'Forbidden'}, status=403)
@@ -589,24 +606,6 @@ def admin_approve_event(request, event_id):
     return Response({
         'message':     f'Event {"approved" if event.is_approved else "rejected"}',
         'is_approved': event.is_approved,
-    })
-
-
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])
-def admin_toggle_event(request, event_id):
-    if not is_super_admin(request.user):
-        return Response({'error': 'Forbidden'}, status=403)
-    from events.models import Event
-    try:
-        event = Event.objects.get(pk=event_id)
-    except Event.DoesNotExist:
-        return Response({'error': 'Event not found'}, status=404)
-    event.is_active = not event.is_active
-    event.save(update_fields=['is_active'])
-    return Response({
-        'message':   f'Event {"activated" if event.is_active else "deactivated"}',
-        'is_active': event.is_active,
     })
 
 
